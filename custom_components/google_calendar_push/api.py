@@ -15,6 +15,37 @@ from .const import SIGNAL_UPDATE_ENDPOINT
 
 _LOGGER = logging.getLogger(__name__)
 
+def _parse_rfc9775_datetime(data):
+    """Recursively parses RFC 9775 datetime strings into proper timezone-aware Python datetime objects."""
+    if isinstance(data, dict):
+        new_dict = {}
+        for k, v in data.items():
+            new_k = k
+            if isinstance(k, str):
+                # Clean RFC 9775 tags from dictionary keys to prevent Pydantic parsing failures
+                match = re.search(r'^(.*?T\d{2}:\d{2}:\d{2}.*?)\[(.*?)\]$', k)
+                if match:
+                    new_k = match.group(1)
+            new_dict[new_k] = _parse_rfc9775_datetime(v)
+        return new_dict
+    elif isinstance(data, list):
+        return [_parse_rfc9775_datetime(v) for v in data]
+    elif isinstance(data, str):
+        # Parse RFC 9775 values and attach proper IANA tzinfo
+        match = re.search(r'^(.*?T\d{2}:\d{2}:\d{2}.*?)\[(.*?)\]$', data)
+        if match:
+            iso_str = match.group(1)
+            iana_tz = match.group(2)
+            try:
+                dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+                tz_info = dt_util.get_time_zone(iana_tz)
+                if tz_info:
+                    dt = dt.astimezone(tz_info)
+                return dt
+            except ValueError:
+                return iso_str
+    return data
+
 def _get_tz_name_and_dt(dt_obj):
     """Safely extract an IANA timezone string and return a safe datetime object."""
     ha_tz = dt_util.DEFAULT_TIME_ZONE
@@ -142,29 +173,44 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
             action = str(alarm_dict.get("action", "")).upper()
             method = "email" if "EMAIL" in action else "popup"
             
-            trigger = str(alarm_dict.get("trigger", ""))
-            clean_trigger = trigger.lstrip('+-')
-            mins = 10 
+            trigger = alarm_dict.get("trigger", "")
             
-            match = re.match(r'^P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$', clean_trigger)
-            if match:
-                weeks = int(match.group(1) or 0)
-                days = int(match.group(2) or 0)
-                hours = int(match.group(3) or 0)
-                minutes = int(match.group(4) or 0)
-                mins = (weeks * 10080) + (days * 1440) + (hours * 60) + minutes
-            elif trigger:
-                try:
-                    trigger_dt = datetime.fromisoformat(trigger.replace('Z', '+00:00'))
-                    if isinstance(dtstart, datetime):
-                        if dtstart.tzinfo and not trigger_dt.tzinfo:
-                            trigger_dt = trigger_dt.replace(tzinfo=dtstart.tzinfo)
-                        elif not dtstart.tzinfo and trigger_dt.tzinfo:
-                            trigger_dt = trigger_dt.replace(tzinfo=None)
-                        delta = dtstart - trigger_dt
-                        mins = max(0, int(delta.total_seconds() / 60))
-                except Exception:
-                    pass
+            if isinstance(trigger, datetime):
+                if isinstance(dtstart, datetime):
+                    trigger_dt = trigger
+                    if dtstart.tzinfo and not trigger_dt.tzinfo:
+                        trigger_dt = trigger_dt.replace(tzinfo=dtstart.tzinfo)
+                    elif not dtstart.tzinfo and trigger_dt.tzinfo:
+                        trigger_dt = trigger_dt.replace(tzinfo=None)
+                    delta = dtstart - trigger_dt
+                    mins = max(0, int(delta.total_seconds() / 60))
+                else:
+                    mins = 10
+            else:
+                trigger_str = str(trigger)
+                clean_trigger = trigger_str.lstrip('+-')
+                mins = 10 
+                
+                match = re.match(r'^P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$', clean_trigger)
+                if match:
+                    weeks = int(match.group(1) or 0)
+                    days = int(match.group(2) or 0)
+                    hours = int(match.group(3) or 0)
+                    minutes = int(match.group(4) or 0)
+                    mins = (weeks * 10080) + (days * 1440) + (hours * 60) + minutes
+                elif trigger_str:
+                    try:
+                        trigger_dt_str = re.sub(r'\[.*?\]$', '', trigger_str)
+                        trigger_dt = datetime.fromisoformat(trigger_dt_str.replace('Z', '+00:00'))
+                        if isinstance(dtstart, datetime):
+                            if dtstart.tzinfo and not trigger_dt.tzinfo:
+                                trigger_dt = trigger_dt.replace(tzinfo=dtstart.tzinfo)
+                            elif not dtstart.tzinfo and trigger_dt.tzinfo:
+                                trigger_dt = trigger_dt.replace(tzinfo=None)
+                            delta = dtstart - trigger_dt
+                            mins = max(0, int(delta.total_seconds() / 60))
+                    except Exception:
+                        pass
 
             mins = max(0, min(mins, 40320))
             override_entry = {"method": method, "minutes": mins}
@@ -266,7 +312,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                             elif isinstance(exc_key, date):
                                 exc_dt = datetime.combine(exc_key, datetime.min.time(), tzinfo=timezone.utc)
                             elif isinstance(exc_key, str):
-                                exc_dt = datetime.fromisoformat(exc_key.replace('Z', '+00:00')).astimezone(timezone.utc)
+                                clean_key = re.sub(r'\[.*?\]$', '', exc_key)
+                                exc_dt = datetime.fromisoformat(clean_key.replace('Z', '+00:00')).astimezone(timezone.utc)
                                 
                             if exc_dt and exc_dt < cutoff_date:
                                 continue 
@@ -283,6 +330,10 @@ class GoogleCalendarPushView(HomeAssistantView):
                                     end_key = raw_key + timedelta(minutes=30)
                                 elif isinstance(raw_key, date):
                                     end_key = raw_key + timedelta(days=1)
+                                elif isinstance(raw_key, str):
+                                    # Fallback parsing for string
+                                    rk_dt = datetime.fromisoformat(re.sub(r'\[.*?\]$', '', raw_key).replace('Z', '+00:00'))
+                                    end_key = (rk_dt + timedelta(minutes=30)).isoformat()
                             except Exception:
                                 pass
                                 
@@ -411,10 +462,12 @@ class GoogleCalendarPushView(HomeAssistantView):
                             
                             if in_dt and go_dt:
                                 try:
-                                    dt1 = datetime.fromisoformat(in_dt.replace('Z', '+00:00'))
+                                    dt1_str = re.sub(r'\[.*?\]$', '', in_dt)
+                                    dt1 = datetime.fromisoformat(dt1_str.replace('Z', '+00:00'))
                                     if dt1.tzinfo: dt1 = dt1.astimezone(timezone.utc)
                                     
-                                    dt2 = datetime.fromisoformat(go_dt.replace('Z', '+00:00'))
+                                    dt2_str = re.sub(r'\[.*?\]$', '', go_dt)
+                                    dt2 = datetime.fromisoformat(dt2_str.replace('Z', '+00:00'))
                                     if dt2.tzinfo: dt2 = dt2.astimezone(timezone.utc)
                                     
                                     if dt1 == dt2:
@@ -451,9 +504,14 @@ class GoogleCalendarPushView(HomeAssistantView):
                     
                     body.pop("iCalUID", None)
                     body.pop("recurrence", None) 
+                    body.pop("originalStartTime", None)
                     
                 else:
                     target_event_id = master_item_id
+
+                if body.get("status") == "cancelled":
+                    body.pop("start", None)
+                    body.pop("end", None)
 
                 unique_req_id = f"{uid}_{index}"
                 req_id_to_body[unique_req_id] = body 
@@ -555,8 +613,10 @@ class GoogleCalendarPushView(HomeAssistantView):
         
         for raw_event in raw_events:
             try:
-                validated_event = Event.model_validate(raw_event)
-                valid_events_data.append((validated_event, raw_event))
+                # --- FIX: Pre-process RFC 9775 strings before Pydantic Validation ---
+                processed_event = _parse_rfc9775_datetime(raw_event)
+                validated_event = Event.model_validate(processed_event)
+                valid_events_data.append((validated_event, processed_event))
             except Exception as e:
                 uid = raw_event.get("uid", "UNKNOWN_UID")
                 _LOGGER.error("Pydantic validation failed for event %s: %s", uid, str(e))
