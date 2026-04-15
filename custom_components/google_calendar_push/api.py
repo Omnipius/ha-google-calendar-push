@@ -366,13 +366,24 @@ class GoogleCalendarPushView(HomeAssistantView):
                 target_event_id = None
                 
                 if is_exception_pass:
-                    # --- FIX: Strict Timezone Mismatch ---
-                    # Google API strictly requires the exception's originalStartTime.timeZone 
-                    # to match the Master event's start.timeZone. Forcefully overwrite it.
+                    # --- FIX: Strict Timezone Offset Mismatch ---
+                    # Google API requires the exception's originalStartTime.timeZone 
+                    # to match the Master event's start.timeZone. Furthermore, the 
+                    # dateTime string MUST be localized to that specific timezone's 
+                    # offset, or Google rejects the mismatched payload.
                     if master_item and "start" in master_item:
                         master_tz = master_item["start"].get("timeZone")
                         if master_tz and "originalStartTime" in body and "dateTime" in body["originalStartTime"]:
-                            body["originalStartTime"]["timeZone"] = master_tz
+                            try:
+                                orig_dt_str = body["originalStartTime"]["dateTime"]
+                                dt = datetime.fromisoformat(orig_dt_str.replace('Z', '+00:00'))
+                                tz_obj = dt_util.get_time_zone(master_tz)
+                                if tz_obj:
+                                    dt_local = dt.astimezone(tz_obj)
+                                    body["originalStartTime"]["dateTime"] = dt_local.isoformat()
+                                    body["originalStartTime"]["timeZone"] = master_tz
+                            except Exception as e:
+                                _LOGGER.error("Failed to localize originalStartTime: %s", e)
                     # -------------------------------------
 
                     # 1. Look for explicitly overridden exception
@@ -419,8 +430,11 @@ class GoogleCalendarPushView(HomeAssistantView):
                          # Still missing? That means the Master wasn't created. Drop the orphan.
                         _LOGGER.warning("Master event %s not found in search or memory. Dropping orphaned exception.", uid)
                         continue 
-                        
+                    
+                    # --- FIX: Prevent 400 Bad Request on Exceptions ---
+                    # Virtual instances cannot contain master properties like iCalUID or recurrence arrays
                     body.pop("iCalUID", None)
+                    body.pop("recurrence", None) 
                     
                 else:
                     target_event_id = master_item_id
