@@ -280,11 +280,14 @@ class GoogleCalendarPushView(HomeAssistantView):
 
             search_batch = service.new_batch_http_request()
             searches_added = 0
+            seen_uids = set() # Track unique UIDs to prevent duplicate search requests
             
             for ev, _ in events_data:
                 uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
-                if not uid:
+                if not uid or uid in seen_uids:
                     continue
+                
+                seen_uids.add(uid)
                 search_batch.add(
                     service.events().list(calendarId=calendar_id, iCalUID=uid, showDeleted=True),
                     request_id=uid,
@@ -303,15 +306,17 @@ class GoogleCalendarPushView(HomeAssistantView):
             # --- BATCH 2: Process Mutations ---
             def mutate_callback(request_id, response, exception):
                 nonlocal processed_count
+                # Strip the index back off to accurately log the original UID in errors
+                original_uid = request_id.rsplit('_', 1)[0] if '_' in request_id else request_id
                 if exception is not None:
-                    api_errors.append({"uid": request_id, "error": str(exception)})
+                    api_errors.append({"uid": original_uid, "error": str(exception)})
                 else:
                     processed_count += 1
 
             mutate_batch = service.new_batch_http_request()
             mutations_added = 0
 
-            for ev, r_ev in events_data:
+            for index, (ev, r_ev) in enumerate(events_data):
                 uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
                 if uid not in search_results:
                     continue 
@@ -320,6 +325,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                 body = _convert_ical_to_google(ev, r_ev)
                 
                 target_event_id = None
+                unique_req_id = f"{uid}_{index}" # Generate unique ID to prevent Batch KeyError
                 
                 # --- STRICT, TIMEZONE-AWARE MATCHING LOGIC ---
                 for item in items:
@@ -360,12 +366,12 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 body.setdefault("status", "confirmed")
                             mutate_batch.add(
                                 service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body),
-                                request_id=uid, callback=mutate_callback
+                                request_id=unique_req_id, callback=mutate_callback
                             )
                         else:
                             mutate_batch.add(
                                 service.events().insert(calendarId=calendar_id, body=body),
-                                request_id=uid, callback=mutate_callback
+                                request_id=unique_req_id, callback=mutate_callback
                             )
                         mutations_added += 1
 
@@ -379,7 +385,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                             body.setdefault("status", "confirmed")
                         mutate_batch.add(
                             service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body),
-                            request_id=uid, callback=mutate_callback
+                            request_id=unique_req_id, callback=mutate_callback
                         )
                         mutations_added += 1
 
@@ -389,7 +395,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                             if target_item.get("status") != "cancelled":
                                 mutate_batch.add(
                                     service.events().delete(calendarId=calendar_id, eventId=target_event_id),
-                                    request_id=uid, callback=mutate_callback
+                                    request_id=unique_req_id, callback=mutate_callback
                                 )
                                 mutations_added += 1
                             else:

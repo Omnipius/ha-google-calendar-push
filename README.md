@@ -1,6 +1,6 @@
 # Google Calendar Push API for Home Assistant
 
-![Version](https://img.shields.io/badge/version-0.0.19-blue.svg)
+![Version](https://img.shields.io/badge/version-0.0.20-blue.svg)
 ![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg)
 
 A robust, Pydantic-validated webhook endpoint to receive and sync rich iCalendar (RFC 5545 / RFC 9775) events directly to Google Calendar. 
