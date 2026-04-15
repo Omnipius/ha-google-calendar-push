@@ -267,6 +267,21 @@ class GoogleCalendarPushView(HomeAssistantView):
         )
         return build("calendar", "v3", credentials=credentials, cache_discovery=False)
 
+    def _parse_events(self, raw_events):
+        """Parse events synchronously in the executor to avoid blocking the event loop."""
+        valid_events_data = []
+        validation_errors = []
+        for raw_event in raw_events:
+            try:
+                processed_event = _parse_rfc9775_datetime(raw_event)
+                validated_event = Event.model_validate(processed_event)
+                valid_events_data.append((validated_event, processed_event))
+            except Exception as e:
+                uid = raw_event.get("uid", "UNKNOWN_UID")
+                _LOGGER.error("Pydantic validation failed for event %s: %s", uid, str(e))
+                validation_errors.append({"uid": uid, "error": f"Validation failed: {str(e)}"})
+        return valid_events_data, validation_errors
+
     async def _execute_batch_chunk(self, service, batch_reqs):
         """Execute a chunk of requests in a thread to prevent blocking the event loop."""
         def _run_batch():
@@ -278,7 +293,6 @@ class GoogleCalendarPushView(HomeAssistantView):
         await self.hass.async_add_executor_job(_run_batch)
 
     async def _process_operation(self, service, calendar_id, operation, valid_events_data):
-        from datetime import datetime, date, timedelta, timezone
         processed_count = 0
         api_errors = []
 
@@ -386,9 +400,14 @@ class GoogleCalendarPushView(HomeAssistantView):
                 
                 if exception is not None:
                     error_msg = str(exception)
-                    sent_body = req_id_to_body.get(request_id, {})
-                    _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
-                    api_errors.append({"uid": original_uid, "error": error_msg})
+                    # --- FIX: Fallback for 404 errors during instance updates ---
+                    # If the instance update fails with a 404, we log it and continue.
+                    if "404" in error_msg:
+                        _LOGGER.warning("Google API instance not found for UID %s: %s", original_uid, error_msg)
+                    else:
+                        sent_body = req_id_to_body.get(request_id, {})
+                        _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
+                        api_errors.append({"uid": original_uid, "error": error_msg})
                 else:
                     processed_count += 1
                     if not is_exception_pass and response and "id" in response:
@@ -486,8 +505,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                     body.pop("recurrence", None) 
                     body.pop("originalStartTime", None)
                     
-                    # --- FIX: Ensure cancellations have an end time ---
-                    # Google requires start and end even for cancellations of virtual instances
                     if body.get("status") == "cancelled" and master_item and "start" in master_item and "end" in master_item:
                         body["start"] = master_item["start"]
                         body["end"] = master_item["end"]
@@ -512,16 +529,14 @@ class GoogleCalendarPushView(HomeAssistantView):
                             target_item = next((i for i in items if i["id"] == target_event_id), {})
                             if target_item.get("status") == "cancelled":
                                 body.setdefault("status", "confirmed")
+                            
+                            # --- FIX: Ensure inserting a new exception updates if it exists ---
                             mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
                         else:
                             mutation_op = service.events().insert(calendarId=calendar_id, body=body)
 
                     elif operation == "update":
                         if not target_event_id:
-                            # --- FIX: Gracefully handle missing virtual instances during update ---
-                            # If we try to update an exception but the virtual instance was never generated,
-                            # we can gracefully fall back to inserting it as a standalone event if needed,
-                            # but usually we should just log and skip to avoid duplicate orphans.
                             api_errors.append({"uid": uid, "error": "Event not found for update"})
                             continue
                         
@@ -574,7 +589,7 @@ class GoogleCalendarPushView(HomeAssistantView):
         if masters_data:
             await execute_pass(masters_data, is_exception_pass=False)
             if exceptions_data:
-                 await asyncio.sleep(0.5) 
+                 await asyncio.sleep(2.0) # Wait 2 seconds for Google to generate instances
                  
         if exceptions_data:
             await execute_pass(exceptions_data, is_exception_pass=True)
@@ -600,18 +615,9 @@ class GoogleCalendarPushView(HomeAssistantView):
         if not isinstance(raw_events, list):
             return web.Response(status=400, text="'events' must be a list.")
 
-        valid_events_data = []
-        validation_errors = []
-        
-        for raw_event in raw_events:
-            try:
-                processed_event = _parse_rfc9775_datetime(raw_event)
-                validated_event = Event.model_validate(processed_event)
-                valid_events_data.append((validated_event, processed_event))
-            except Exception as e:
-                uid = raw_event.get("uid", "UNKNOWN_UID")
-                _LOGGER.error("Pydantic validation failed for event %s: %s", uid, str(e))
-                validation_errors.append({"uid": uid, "error": f"Validation failed: {str(e)}"})
+        valid_events_data, validation_errors = await self.hass.async_add_executor_job(
+            self._parse_events, raw_events
+        )
 
         if not valid_events_data:
             return web.json_response({
