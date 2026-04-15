@@ -229,11 +229,17 @@ class GoogleCalendarPushView(HomeAssistantView):
 
     def _process_operation(self, service, calendar_id, operation, valid_events_data):
         from datetime import datetime, date, timedelta, timezone
+        import time
         processed_count = 0
         api_errors = []
 
         masters_data = []
         exceptions_data = []
+        
+        # --- PROTECTION 1: Ignore ancient exceptions (older than 60 days)
+        # Prevents Google 404 errors on deeply historical virtual instances.
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
+        
         for event, raw_event in valid_events_data:
             if getattr(event, "recurrence_id", None):
                 exceptions_data.append((event, raw_event))
@@ -246,6 +252,21 @@ class GoogleCalendarPushView(HomeAssistantView):
                 
                 if len(exceptions) == len(raw_exceptions):
                     for (exc_key, exc_event), (raw_key, raw_val) in zip(exceptions.items(), raw_exceptions.items()):
+                        
+                        try:
+                            exc_dt = None
+                            if isinstance(exc_key, datetime):
+                                exc_dt = exc_key.astimezone(timezone.utc)
+                            elif isinstance(exc_key, date):
+                                exc_dt = datetime.combine(exc_key, datetime.min.time(), tzinfo=timezone.utc)
+                            elif isinstance(exc_key, str):
+                                exc_dt = datetime.fromisoformat(exc_key.replace('Z', '+00:00')).astimezone(timezone.utc)
+                                
+                            if exc_dt and exc_dt < cutoff_date:
+                                continue # Safely skip pushing ancient history to Google
+                        except Exception:
+                            pass 
+                            
                         if exc_event is None:
                             uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
                             cancel_raw = {
@@ -269,17 +290,27 @@ class GoogleCalendarPushView(HomeAssistantView):
             nonlocal processed_count
             search_results = {}
             
-            # --- BATCH 1: Search for existing events by UID ---
             def search_callback(request_id, response, exception):
                 if exception is not None:
-                    error_msg = str(exception)
-                    _LOGGER.error("Google API Search Error for UID %s: %s", request_id, error_msg)
-                    api_errors.append({"uid": request_id, "error": error_msg})
+                    api_errors.append({"uid": request_id, "error": str(exception)})
                 else:
                     search_results[request_id] = response.get("items", [])
 
-            search_batch = service.new_batch_http_request()
-            searches_added = 0
+            # --- PROTECTION 2: Chunk Execution to honor Google API Rate Limits
+            def execute_in_chunks(batch_reqs, chunk_size=50):
+                for i in range(0, len(batch_reqs), chunk_size):
+                    chunk = batch_reqs[i:i + chunk_size]
+                    batch = service.new_batch_http_request()
+                    for req, req_id, cb in chunk:
+                        batch.add(req, request_id=req_id, callback=cb)
+                    try:
+                        batch.execute()
+                        time.sleep(0.3) # Micro-backoff to stay under Burst Limits
+                    except Exception as e:
+                        _LOGGER.error("Chunk execution failed: %s", e)
+                        api_errors.append({"error": f"Batch chunk failed: {e}"})
+
+            search_reqs = []
             seen_uids = set()
             
             for ev, _ in events_data:
@@ -287,22 +318,12 @@ class GoogleCalendarPushView(HomeAssistantView):
                 if not uid or uid in seen_uids:
                     continue
                 seen_uids.add(uid)
-                search_batch.add(
-                    service.events().list(calendarId=calendar_id, iCalUID=uid, showDeleted=True),
-                    request_id=uid,
-                    callback=search_callback
-                )
-                searches_added += 1
+                req = service.events().list(calendarId=calendar_id, iCalUID=uid, showDeleted=True)
+                search_reqs.append((req, uid, search_callback))
 
-            if searches_added > 0:
-                try:
-                    search_batch.execute()
-                except Exception as e:
-                    _LOGGER.error("Batch search execution failed: %s", e)
-                    api_errors.append({"error": f"Batch search failed: {e}"})
-                    return
+            if search_reqs:
+                execute_in_chunks(search_reqs, chunk_size=50)
 
-            # --- BATCH 2: Process Mutations ---
             def mutate_callback(request_id, response, exception):
                 nonlocal processed_count
                 original_uid = request_id.rsplit('_', 1)[0] if '_' in request_id else request_id
@@ -331,9 +352,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                         
                 target_event_id = None
                 
-                # --- INTELLIGENT MATCHING & VIRTUAL ID COMPUTATION ---
                 if is_exception_pass:
-                    # 1. Search for explicitly overridden exception
                     for item in items:
                         if "originalStartTime" in item:
                             in_start = body.get("originalStartTime", {})
@@ -357,7 +376,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                                     target_event_id = item["id"]
                                     break
                     
-                    # 2. Compute Google's Virtual Instance ID to prevent 409 Conflicts
                     if not target_event_id and master_item_id:
                         orig_time = body.get("originalStartTime", {})
                         try:
@@ -374,12 +392,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                             _LOGGER.error("Instance ID computation failed for UID %s: %s", uid, e)
                             
                     if not target_event_id:
-                        # Missing Master -> Prevent 400 Bad Request by aborting orphaned exception
-                        _LOGGER.warning("Could not find master event for exception UID %s. Skipping.", uid)
-                        api_errors.append({"uid": uid, "error": "Master event not found. Cannot create orphaned exception."})
-                        continue
+                        continue # Drop orphaned exceptions
                         
-                    # Prevent 400 Bad Request by stripping iCalUID from instance updates
                     body.pop("iCalUID", None)
                     
                 else:
@@ -406,7 +420,6 @@ class GoogleCalendarPushView(HomeAssistantView):
 
                     elif operation == "update":
                         if not target_event_id:
-                            _LOGGER.warning("Could not find event UID %s to update.", uid)
                             api_errors.append({"uid": uid, "error": "Event not found for update"})
                             continue
                         
@@ -436,28 +449,20 @@ class GoogleCalendarPushView(HomeAssistantView):
                     _LOGGER.error("Mutation preparation error for UID %s: %s", uid, e)
                     api_errors.append({"uid": uid, "error": str(e)})
 
-            # --- CONFLICT-FREE BATCH EXECUTION ---
+            # Safely extract ops without conflicts and chunk them into batches of 50
             uid_op_lists = {u: list(ops.values()) for u, ops in uid_operations.items()}
             max_ops = max([len(ops) for ops in uid_op_lists.values()]) if uid_op_lists else 0
 
             for i in range(max_ops):
-                mutate_batch = service.new_batch_http_request()
-                mutations_added = 0
-                
+                mutate_reqs = []
                 for u, ops in uid_op_lists.items():
                     if i < len(ops):
                         mut_op, req_id = ops[i]
-                        mutate_batch.add(mut_op, request_id=req_id, callback=mutate_callback)
-                        mutations_added += 1
+                        mutate_reqs.append((mut_op, req_id, mutate_callback))
                         
-                if mutations_added > 0:
-                    try:
-                        mutate_batch.execute()
-                    except Exception as e:
-                        _LOGGER.error("Batch mutation execution failed: %s", e)
-                        api_errors.append({"error": f"Batch execution failed: {e}"})
+                if mutate_reqs:
+                    execute_in_chunks(mutate_reqs, chunk_size=50)
 
-        # Execute Masters first, then Exceptions
         if masters_data:
             execute_pass(masters_data, is_exception_pass=False)
         if exceptions_data:
