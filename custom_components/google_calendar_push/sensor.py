@@ -1,5 +1,5 @@
 import logging
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -76,6 +76,7 @@ class GoogleCalendarEndpointSensor(SensorEntity):
     # Using standard HA icons
     _attr_icon = "mdi:calendar-arrow-right"
     _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
 
     def __init__(self, alias, calendar_id, calendar_name, entry_id):
         """Initialize the sensor."""
@@ -102,6 +103,8 @@ class GoogleCalendarEndpointSensor(SensorEntity):
             "last_events_processed": 0,
             "last_received": "Never"
         }
+
+        self._attr_native_value = None # <-- Start as None instead of "listening"
         
     async def async_added_to_hass(self):
         """Run when entity about to be added to hass."""
@@ -117,10 +120,10 @@ class GoogleCalendarEndpointSensor(SensorEntity):
     @callback
     def _handle_push_update(self, operation, count):
         """Handle a push notification update."""
-        self._attr_native_value = "received_push"
+        self._attr_native_value = dt_util.now()
+
         self._attr_extra_state_attributes["last_operation"] = operation
         self._attr_extra_state_attributes["last_events_processed"] = count
-        self._attr_extra_state_attributes["last_received"] = dt_util.now().isoformat()
         
         # Tell HA to immediately update the dashboard
         self.async_write_ha_state()
