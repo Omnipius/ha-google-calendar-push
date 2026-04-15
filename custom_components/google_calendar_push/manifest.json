@@ -1,0 +1,14 @@
+{
+  "domain": "google_calendar_push",
+  "name": "Google Calendar Push API",
+  "codeowners": ["@Omnipius"],
+  "config_flow": true,
+  "dependencies": ["application_credentials", "http"],
+  "requirements": [
+    "google-api-python-client==2.111.0",
+    "google-auth-oauthlib==1.2.0",
+    "ical>=8.0.0"
+  ],
+  "iot_class": "cloud_push",
+  "version": "0.0.18"
+}

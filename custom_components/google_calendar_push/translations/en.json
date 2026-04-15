@@ -1,0 +1,56 @@
+{
+  "config": {
+    "step": {
+      "pick_implementation": {
+        "title": "Choose Authentication Method"
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Google Calendar Push",
+        "description": "Your Google authentication has expired or is invalid. Please click Submit to re-authenticate with your Google account and issue a new token."
+      },
+      "calendars": {
+        "title": "Select Target Calendars",
+        "description": "Please select the Google Calendars you wish to allow this endpoint to modify.\n\n**Instructions:**\n1. Only calendars where you have **Writer** or **Owner** permissions are listed.\n2. Use the dropdown to check the boxes for specific calendars.\n3. If no calendars are selected, the API will be disabled for this account.",
+        "data": {
+          "configured_calendars": "Editable Calendars"
+        }
+      },
+      "aliases": {
+        "title": "Set Endpoint Aliases",
+        "description": "Assign a short, custom endpoint name for each selected calendar.\n\nThese will be used in your API URL: `/api/google_calendar_push/<alias>`\n\n**Rules:** Only lowercase letters, numbers, and underscores are allowed."
+      }
+    },
+    "error": {
+      "invalid_alias": "Aliases must contain ONLY lowercase letters, numbers, and underscores.",
+      "duplicate_alias": "Each calendar must have a unique alias."
+    },
+    "abort": {
+      "missing_configuration": "The component is not configured. Please follow the documentation.",
+      "oauth_error": "Received invalid token data.",
+      "calendar_fetch_failed": "Could not fetch the list of calendars from Google API.",
+      "reauth_successful": "Re-authentication was successful!"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Managed Calendars",
+        "description": "Select which calendars this integration is allowed to access. Only editable calendars are shown.",
+        "data": {
+          "configured_calendars": "Editable Calendars"
+        }
+      },
+      "aliases": {
+        "title": "Set Endpoint Aliases",
+        "description": "Assign a short, custom endpoint name for each selected calendar.\n\nThese will be used in your API URL: `/api/google_calendar_push/[alias]`\n\n**Rules:** Only lowercase letters, numbers, and underscores are allowed."
+      }
+    },
+    "error": {
+      "invalid_alias": "Aliases must contain ONLY lowercase letters, numbers, and underscores.",
+      "duplicate_alias": "Each calendar must have a unique alias."
+    },
+    "abort": {
+      "calendar_fetch_failed": "Could not communicate with Google to fetch your calendars. Check your logs."
+    }
+  }
+}
