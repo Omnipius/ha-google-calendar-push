@@ -96,7 +96,7 @@ class Event(iCalEvent):
         default=None,
     )
 
-    # FIX: Explicitly patching recurrence_id so Pydantic doesn't crash on it!
+    # Explicitly patching recurrence_id so Pydantic doesn't crash on it!
     recurrence_id: Annotated[
         Union[datetime.datetime, datetime.date, None],
         BeforeValidator(parse_date_and_datetime),
@@ -104,6 +104,9 @@ class Event(iCalEvent):
         alias="recurrence-id",
         default=None,
     )
+
+    # Add the nested exceptions dictionary
+    exceptions: Optional[Dict[Union[datetime.date, datetime.datetime, str], Optional["Event"]]] = None
 
     @field_serializer('*')
     def serialize_fields(self, value: Any, info: FieldSerializationInfo) -> Any:

@@ -224,6 +224,7 @@ class GoogleCalendarPushView(HomeAssistantView):
         return build("calendar", "v3", credentials=credentials, cache_discovery=False)
 
     def _process_operation(self, service, calendar_id, operation, valid_events_data):
+        from datetime import datetime
         processed_count = 0
         api_errors = []
 
@@ -231,10 +232,39 @@ class GoogleCalendarPushView(HomeAssistantView):
         masters_data = []
         exceptions_data = []
         for event, raw_event in valid_events_data:
+            # 1. Legacy Interoperability (Flat lists of exceptions)
             if getattr(event, "recurrence_id", None):
                 exceptions_data.append((event, raw_event))
             else:
                 masters_data.append((event, raw_event))
+
+            # 2. Unpack Nested Exceptions (New Schema)
+            exceptions = getattr(event, "exceptions", None)
+            if exceptions:
+                raw_exceptions = raw_event.get("exceptions", {})
+                
+                # Zip is safe because Pydantic preserves the JSON dict order
+                if len(exceptions) == len(raw_exceptions):
+                    for (exc_key, exc_event), (raw_key, raw_val) in zip(exceptions.items(), raw_exceptions.items()):
+                        if exc_event is None:
+                            # Handle Deleted Occurrences (null values)
+                            uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
+                            cancel_raw = {
+                                "uid": uid,
+                                "recurrence-id": raw_key,
+                                "status": "CANCELLED"
+                            }
+                            try:
+                                cancel_event = Event.model_validate(cancel_raw)
+                                exceptions_data.append((cancel_event, cancel_raw))
+                            except Exception as e:
+                                _LOGGER.error("Validation failed for cancellation exception: %s", e)
+                        else:
+                            # Handle Modified Occurrences
+                            # Ensure we pass the raw dict downstream so alarms can be parsed
+                            exceptions_data.append((exc_event, raw_val if isinstance(raw_val, dict) else {}))
+                else:
+                    _LOGGER.warning("Mismatch in exceptions dict length for UID %s", getattr(event, "uid", None))
 
         # Helper function to run a complete batch pass
         def execute_pass(events_data, is_exception_pass):
@@ -251,8 +281,8 @@ class GoogleCalendarPushView(HomeAssistantView):
             search_batch = service.new_batch_http_request()
             searches_added = 0
             
-            for event, raw_event in events_data:
-                uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
+            for ev, _ in events_data:
+                uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
                 if not uid:
                     continue
                 search_batch.add(
@@ -281,27 +311,42 @@ class GoogleCalendarPushView(HomeAssistantView):
             mutate_batch = service.new_batch_http_request()
             mutations_added = 0
 
-            for event, raw_event in events_data:
-                uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
+            for ev, r_ev in events_data:
+                uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
                 if uid not in search_results:
                     continue 
                     
                 items = search_results[uid]
-                body = _convert_ical_to_google(event, raw_event)
+                body = _convert_ical_to_google(ev, r_ev)
                 
                 target_event_id = None
                 
-                # --- STRICT MATCHING LOGIC ---
+                # --- STRICT, TIMEZONE-AWARE MATCHING LOGIC ---
                 for item in items:
                     if is_exception_pass:
                         if "originalStartTime" in item:
-                            # Must strictly match the exact date/time of the exception
                             in_start = body.get("originalStartTime", {})
                             go_start = item.get("originalStartTime", {})
                             
-                            if in_start.get("dateTime") == go_start.get("dateTime") and in_start.get("date") == go_start.get("date"):
-                                target_event_id = item["id"]
-                                break
+                            in_dt = in_start.get("dateTime")
+                            go_dt = go_start.get("dateTime")
+                            
+                            # Safely handle timezone offset string matches (Z vs +00:00)
+                            if in_dt and go_dt:
+                                try:
+                                    dt1 = datetime.fromisoformat(in_dt.replace('Z', '+00:00'))
+                                    dt2 = datetime.fromisoformat(go_dt.replace('Z', '+00:00'))
+                                    if dt1 == dt2:
+                                        target_event_id = item["id"]
+                                        break
+                                except ValueError:
+                                    if in_dt == go_dt:
+                                        target_event_id = item["id"]
+                                        break
+                            elif in_start.get("date") and go_start.get("date"):
+                                if in_start.get("date") == go_start.get("date"):
+                                    target_event_id = item["id"]
+                                    break
                     else:
                         if "originalStartTime" not in item:
                             target_event_id = item["id"]
