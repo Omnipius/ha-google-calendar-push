@@ -17,7 +17,6 @@ from .const import SIGNAL_UPDATE_ENDPOINT
 
 _LOGGER = logging.getLogger(__name__)
 
-# --- FIX: Map Microsoft/Windows Timezones to IANA ---
 WINDOWS_TO_IANA_MAP = {
     "GMT Standard Time": "Europe/London",
     "Pacific Standard Time": "America/Los_Angeles",
@@ -29,7 +28,7 @@ WINDOWS_TO_IANA_MAP = {
     "Central Europe Standard Time": "Europe/Prague",
     "Romance Standard Time": "Europe/Paris",
     "India Standard Time": "Asia/Calcutta",
-    "China Standard Time": "Asia/Calcutta",
+    "China Standard Time": "Asia/Shanghai",
     "Tokyo Standard Time": "Asia/Tokyo",
     "AUS Eastern Standard Time": "Australia/Sydney",
 }
@@ -54,7 +53,6 @@ def _parse_rfc9775_datetime(data):
             iso_str = match.group(1)
             raw_tz_name = match.group(2)
             
-            # Map Windows zones to IANA if necessary
             iana_tz_name = WINDOWS_TO_IANA_MAP.get(raw_tz_name, raw_tz_name)
             
             try:
@@ -448,9 +446,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                 for item in items:
                     if "originalStartTime" not in item:
                         master_item_id = item["id"]
-                        # --- FIX: Prevent double-suffixing of ID ---
-                        # If a master ID already contains a virtual instance suffix (e.g. _20260402T213500Z), 
-                        # we must strip it before we compute a new instance suffix below.
                         if "_" in master_item_id:
                              master_item_id = master_item_id.split("_")[0]
                         master_item = item
@@ -560,7 +555,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 body.setdefault("status", "confirmed")
                             mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
                         else:
-                            mutation_op = service.events().insert(calendarId=calendar_id, body=body)
+                            # --- FIX: Use import_ for robust upserts ---
+                            mutation_op = service.events().import_(calendarId=calendar_id, body=body)
 
                     elif operation == "update":
                         if not target_event_id:
