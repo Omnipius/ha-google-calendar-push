@@ -14,7 +14,7 @@ from .const import DOMAIN, SIGNAL_UPDATE_ENDPOINT
 _LOGGER = logging.getLogger(__name__)
 
 def get_calendar_names(token_data, calendar_ids):
-    """Fetch the real names of the calendars from Google."""
+    """Fetch the real names of the calendars from Google in a single optimized pass."""
     credentials = Credentials(
         token=token_data["access_token"],
         refresh_token=token_data.get("refresh_token"),
@@ -24,13 +24,24 @@ def get_calendar_names(token_data, calendar_ids):
     )
     service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
     names = {}
-    for cid in calendar_ids:
-        try:
-            # calendarList.get returns the user's custom name/settings for the calendar
-            cal = service.calendarList().get(calendarId=cid).execute()
-            names[cid] = cal.get("summary", cid)
-        except Exception:
+    
+    try:
+        # Fetch all calendars once O(1) instead of iterating
+        calendars_result = service.calendarList().list().execute()
+        items = calendars_result.get("items", [])
+        
+        # Create a fast lookup map
+        cal_map = {item["id"]: item.get("summary", item["id"]) for item in items}
+        
+        for cid in calendar_ids:
+            names[cid] = cal_map.get(cid, cid)
+            
+    except Exception as e:
+        _LOGGER.error("Error fetching bulk calendar list: %s", e)
+        # Fallback to pure IDs if the network fetch fails
+        for cid in calendar_ids:
             names[cid] = cid
+            
     return names
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
