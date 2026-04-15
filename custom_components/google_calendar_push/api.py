@@ -352,9 +352,11 @@ class GoogleCalendarPushView(HomeAssistantView):
                 body = _convert_ical_to_google(ev, r_ev)
                 
                 master_item_id = None
+                master_item = None
                 for item in items:
                     if "originalStartTime" not in item:
                         master_item_id = item["id"]
+                        master_item = item
                         break
                         
                 # Race Condition Fix: If search didn't find the master, pull it from memory
@@ -364,6 +366,15 @@ class GoogleCalendarPushView(HomeAssistantView):
                 target_event_id = None
                 
                 if is_exception_pass:
+                    # --- FIX: Strict Timezone Mismatch ---
+                    # Google API strictly requires the exception's originalStartTime.timeZone 
+                    # to match the Master event's start.timeZone. Forcefully overwrite it.
+                    if master_item and "start" in master_item:
+                        master_tz = master_item["start"].get("timeZone")
+                        if master_tz and "originalStartTime" in body and "dateTime" in body["originalStartTime"]:
+                            body["originalStartTime"]["timeZone"] = master_tz
+                    # -------------------------------------
+
                     # 1. Look for explicitly overridden exception
                     for item in items:
                         if "originalStartTime" in item:
