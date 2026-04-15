@@ -1,6 +1,7 @@
 import logging
 import re
 import json
+import asyncio
 from datetime import datetime, date, timedelta, timezone
 from aiohttp import web
 
@@ -22,7 +23,6 @@ def _parse_rfc9775_datetime(data):
         for k, v in data.items():
             new_k = k
             if isinstance(k, str):
-                # Clean RFC 9775 tags from dictionary keys to prevent Pydantic parsing failures
                 match = re.search(r'^(.*?T\d{2}:\d{2}:\d{2}.*?)\[(.*?)\]$', k)
                 if match:
                     new_k = match.group(1)
@@ -31,7 +31,6 @@ def _parse_rfc9775_datetime(data):
     elif isinstance(data, list):
         return [_parse_rfc9775_datetime(v) for v in data]
     elif isinstance(data, str):
-        # Parse RFC 9775 values and attach proper IANA tzinfo
         match = re.search(r'^(.*?T\d{2}:\d{2}:\d{2}.*?)\[(.*?)\]$', data)
         if match:
             iso_str = match.group(1)
@@ -72,21 +71,17 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
     """Strictly map to Google Calendar API format."""
     body = {}
     
-    # 1. UID
     uid = getattr(event, "uid", None) or getattr(event, "icaluid", None)
     if uid:
         body["iCalUID"] = str(uid)
         
-    # 2. Basic strings
     if getattr(event, "summary", None): body["summary"] = event.summary
     if getattr(event, "description", None): body["description"] = event.description
     if getattr(event, "location", None): body["location"] = event.location
 
-    # 3. Dates
     dtstart = getattr(event, "dtstart", None)
     dtend = getattr(event, "dtend", None)
 
-    # --- FIX: Prevent "Zero Duration" Errors ---
     if dtstart and not dtend:
         if isinstance(dtstart, datetime):
             dtend = dtstart + timedelta(minutes=30)
@@ -119,7 +114,6 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         elif isinstance(dtend, date):
             body["end"] = {"date": dtend.isoformat()}
 
-    # 3b. Exceptions to Recurring Events
     recurrence_id = getattr(event, "recurrence_id", None)
     if recurrence_id:
         if isinstance(recurrence_id, datetime):
@@ -131,7 +125,6 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         elif isinstance(recurrence_id, date):
             body["originalStartTime"] = {"date": recurrence_id.isoformat()}
 
-    # 4. Enums
     status = getattr(event, "status", None)
     if status:
         body["status"] = str(status.value).lower() if hasattr(status, 'value') else str(status).lower()
@@ -144,7 +137,6 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
     if classification:
         body["visibility"] = str(classification.value).lower() if hasattr(classification, 'value') else str(classification).lower()
 
-    # 5. RRULE
     rrule = getattr(event, "rrule", None)
     if rrule:
         recurrence_rules = []
@@ -163,7 +155,6 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         if recurrence_rules:
             body["recurrence"] = recurrence_rules
 
-    # 6. Alarms
     alarms_list = raw_event.get("valarm") or raw_event.get("alarms") or []
     if alarms_list and isinstance(alarms_list, list):
         overrides = []
@@ -223,7 +214,6 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
                 "overrides": overrides[:5] 
             }
 
-    # 7. Attendees
     attendees = getattr(event, "attendees", None)
     if attendees:
         google_attendees = []
@@ -236,7 +226,6 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         if google_attendees:
             body["attendees"] = google_attendees
 
-    # 8. Organizer
     organizer = getattr(event, "organizer", None)
     if organizer:
         email = getattr(organizer, "cal_address", str(organizer))
@@ -245,12 +234,10 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         if "@" in email:
             body["organizer"] = {"email": email}
 
-    # 9. URL
     url = getattr(event, "url", None)
     if url:
         body["source"] = {"url": str(url), "title": "Original Event Link"}
 
-    # 10. Categories
     categories = getattr(event, "categories", None)
     if categories:
         cat_str = f"\n\nCategories: {', '.join(categories)}"
@@ -280,16 +267,24 @@ class GoogleCalendarPushView(HomeAssistantView):
         )
         return build("calendar", "v3", credentials=credentials, cache_discovery=False)
 
-    def _process_operation(self, service, calendar_id, operation, valid_events_data):
+    async def _execute_batch_chunk(self, service, batch_reqs):
+        """Execute a chunk of requests in a thread to prevent blocking the event loop."""
+        def _run_batch():
+            batch = service.new_batch_http_request()
+            for req, req_id, cb in batch_reqs:
+                batch.add(req, request_id=req_id, callback=cb)
+            batch.execute()
+            
+        await self.hass.async_add_executor_job(_run_batch)
+
+    async def _process_operation(self, service, calendar_id, operation, valid_events_data):
         from datetime import datetime, date, timedelta, timezone
-        import time
         processed_count = 0
         api_errors = []
 
         masters_data = []
         exceptions_data = []
         
-        # --- PROTECTION 1: Ignore ancient exceptions (older than 60 days)
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
         
         for event, raw_event in valid_events_data:
@@ -323,7 +318,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                         if exc_event is None:
                             uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
                             
-                            # --- FIX: Prevent zero-duration cancellation objects ---
                             end_key = raw_key
                             try:
                                 if isinstance(raw_key, datetime):
@@ -331,7 +325,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 elif isinstance(raw_key, date):
                                     end_key = raw_key + timedelta(days=1)
                                 elif isinstance(raw_key, str):
-                                    # Fallback parsing for string
                                     rk_dt = datetime.fromisoformat(re.sub(r'\[.*?\]$', '', raw_key).replace('Z', '+00:00'))
                                     end_key = (rk_dt + timedelta(minutes=30)).isoformat()
                             except Exception:
@@ -354,7 +347,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                 else:
                     _LOGGER.warning("Mismatch in exceptions dict length for UID %s", getattr(event, "uid", None))
 
-        def execute_pass(events_data, is_exception_pass):
+        async def execute_pass(events_data, is_exception_pass):
             nonlocal processed_count
             search_results = {}
             newly_created_masters = {}
@@ -365,19 +358,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                     api_errors.append({"uid": request_id, "error": str(exception)})
                 else:
                     search_results[request_id] = response.get("items", [])
-
-            def execute_in_chunks(batch_reqs, chunk_size=50):
-                for i in range(0, len(batch_reqs), chunk_size):
-                    chunk = batch_reqs[i:i + chunk_size]
-                    batch = service.new_batch_http_request()
-                    for req, req_id, cb in chunk:
-                        batch.add(req, request_id=req_id, callback=cb)
-                    try:
-                        batch.execute()
-                        time.sleep(0.3)
-                    except Exception as e:
-                        _LOGGER.error("Chunk execution failed: %s", e)
-                        api_errors.append({"error": f"Batch chunk failed: {e}"})
 
             search_reqs = []
             seen_uids = set()
@@ -391,7 +371,14 @@ class GoogleCalendarPushView(HomeAssistantView):
                 search_reqs.append((req, uid, search_callback))
 
             if search_reqs:
-                execute_in_chunks(search_reqs, chunk_size=50)
+                chunk_size = 50
+                for i in range(0, len(search_reqs), chunk_size):
+                    chunk = search_reqs[i:i + chunk_size]
+                    try:
+                        await self._execute_batch_chunk(service, chunk)
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        _LOGGER.error("Search chunk execution failed: %s", e)
 
             def mutate_callback(request_id, response, exception):
                 nonlocal processed_count
@@ -429,10 +416,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                 target_event_id = None
                 
                 if is_exception_pass:
-                    # --- FIX: Master Time Synchronization ---
-                    # To completely prevent Naive DateTime shifting or Outlook drift,
-                    # we extract the date from the exception, but lock the time of day 
-                    # and timezone perfectly to the Master event. 
                     if master_item and "start" in master_item:
                         m_start = master_item["start"].get("dateTime")
                         m_tz = master_item["start"].get("timeZone")
@@ -450,9 +433,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                                     body["originalStartTime"]["timeZone"] = m_tz
                             except Exception as e:
                                 _LOGGER.error("Failed to sync originalStartTime: %s", e)
-                    # -------------------------------------
 
-                    # 1. Look for explicitly overridden exception
                     for item in items:
                         if "originalStartTime" in item:
                             in_start = body.get("originalStartTime", {})
@@ -482,7 +463,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                                     target_event_id = item["id"]
                                     break
                     
-                    # 2. Compute Virtual Instance ID
                     if not target_event_id and master_item_id:
                         orig_time = body.get("originalStartTime", {})
                         try:
@@ -506,12 +486,14 @@ class GoogleCalendarPushView(HomeAssistantView):
                     body.pop("recurrence", None) 
                     body.pop("originalStartTime", None)
                     
+                    # --- FIX: Ensure cancellations have an end time ---
+                    # Google requires start and end even for cancellations of virtual instances
+                    if body.get("status") == "cancelled" and master_item and "start" in master_item and "end" in master_item:
+                        body["start"] = master_item["start"]
+                        body["end"] = master_item["end"]
+                    
                 else:
                     target_event_id = master_item_id
-
-                if body.get("status") == "cancelled":
-                    body.pop("start", None)
-                    body.pop("end", None)
 
                 unique_req_id = f"{uid}_{index}"
                 req_id_to_body[unique_req_id] = body 
@@ -536,6 +518,10 @@ class GoogleCalendarPushView(HomeAssistantView):
 
                     elif operation == "update":
                         if not target_event_id:
+                            # --- FIX: Gracefully handle missing virtual instances during update ---
+                            # If we try to update an exception but the virtual instance was never generated,
+                            # we can gracefully fall back to inserting it as a standalone event if needed,
+                            # but usually we should just log and skip to avoid duplicate orphans.
                             api_errors.append({"uid": uid, "error": "Event not found for update"})
                             continue
                         
@@ -576,16 +562,22 @@ class GoogleCalendarPushView(HomeAssistantView):
                         mutate_reqs.append((mut_op, req_id, mutate_callback))
                         
                 if mutate_reqs:
-                    execute_in_chunks(mutate_reqs, chunk_size=50)
+                    chunk_size = 50
+                    for j in range(0, len(mutate_reqs), chunk_size):
+                        chunk = mutate_reqs[j:j + chunk_size]
+                        try:
+                            await self._execute_batch_chunk(service, chunk)
+                            await asyncio.sleep(0.3)
+                        except Exception as e:
+                            _LOGGER.error("Mutation chunk execution failed: %s", e)
 
         if masters_data:
-            execute_pass(masters_data, is_exception_pass=False)
+            await execute_pass(masters_data, is_exception_pass=False)
             if exceptions_data:
-                 import time
-                 time.sleep(0.5) 
+                 await asyncio.sleep(0.5) 
                  
         if exceptions_data:
-            execute_pass(exceptions_data, is_exception_pass=True)
+            await execute_pass(exceptions_data, is_exception_pass=True)
 
         return processed_count, api_errors
     
@@ -613,7 +605,6 @@ class GoogleCalendarPushView(HomeAssistantView):
         
         for raw_event in raw_events:
             try:
-                # --- FIX: Pre-process RFC 9775 strings before Pydantic Validation ---
                 processed_event = _parse_rfc9775_datetime(raw_event)
                 validated_event = Event.model_validate(processed_event)
                 valid_events_data.append((validated_event, processed_event))
@@ -636,8 +627,8 @@ class GoogleCalendarPushView(HomeAssistantView):
 
         service = await self.hass.async_add_executor_job(self._get_google_service)
         
-        processed_count, api_errors = await self.hass.async_add_executor_job(
-            self._process_operation, service, calendar_id, operation, valid_events_data
+        processed_count, api_errors = await self._process_operation(
+            service, calendar_id, operation, valid_events_data
         )
 
         all_errors = validation_errors + api_errors
