@@ -535,6 +535,14 @@ class GoogleCalendarPushView(HomeAssistantView):
                     
                 else:
                     target_event_id = master_item_id
+                    
+                    # --- FIX: Sequence Management for Google Import ---
+                    # When importing an event, Google requires the sequence number to be 
+                    # greater than or equal to the existing sequence number.
+                    if master_item and "sequence" in master_item:
+                        body["sequence"] = master_item["sequence"] + 1
+                    else:
+                        body["sequence"] = 0
 
                 unique_req_id = f"{uid}_{index}"
                 req_id_to_body[unique_req_id] = body 
@@ -555,7 +563,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 body.setdefault("status", "confirmed")
                             mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
                         else:
-                            # --- FIX: Use import_ for robust upserts ---
                             mutation_op = service.events().import_(calendarId=calendar_id, body=body)
 
                     elif operation == "update":
