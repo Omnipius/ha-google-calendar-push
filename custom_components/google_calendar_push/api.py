@@ -228,7 +228,7 @@ class GoogleCalendarPushView(HomeAssistantView):
         return build("calendar", "v3", credentials=credentials, cache_discovery=False)
 
     def _process_operation(self, service, calendar_id, operation, valid_events_data):
-        from datetime import datetime, timedelta
+        from datetime import datetime, date, timedelta, timezone
         processed_count = 0
         api_errors = []
 
@@ -313,7 +313,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                 else:
                     processed_count += 1
 
-            # Map UIDs to their specific operations to prevent lock conflicts
             uid_operations = {}
 
             for index, (ev, r_ev) in enumerate(events_data):
@@ -324,15 +323,21 @@ class GoogleCalendarPushView(HomeAssistantView):
                 items = search_results[uid]
                 body = _convert_ical_to_google(ev, r_ev)
                 
-                target_event_id = None
-                unique_req_id = f"{uid}_{index}" 
-                
+                master_item_id = None
                 for item in items:
-                    if is_exception_pass:
+                    if "originalStartTime" not in item:
+                        master_item_id = item["id"]
+                        break
+                        
+                target_event_id = None
+                
+                # --- INTELLIGENT MATCHING & VIRTUAL ID COMPUTATION ---
+                if is_exception_pass:
+                    # 1. Search for explicitly overridden exception
+                    for item in items:
                         if "originalStartTime" in item:
                             in_start = body.get("originalStartTime", {})
                             go_start = item.get("originalStartTime", {})
-                            
                             in_dt = in_start.get("dateTime")
                             go_dt = go_start.get("dateTime")
                             
@@ -351,12 +356,36 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 if in_start.get("date") == go_start.get("date"):
                                     target_event_id = item["id"]
                                     break
-                    else:
-                        if "originalStartTime" not in item:
-                            target_event_id = item["id"]
-                            break
+                    
+                    # 2. Compute Google's Virtual Instance ID to prevent 409 Conflicts
+                    if not target_event_id and master_item_id:
+                        orig_time = body.get("originalStartTime", {})
+                        try:
+                            if 'dateTime' in orig_time:
+                                dt = datetime.fromisoformat(orig_time['dateTime'].replace('Z', '+00:00'))
+                                dt_utc = dt.astimezone(timezone.utc)
+                                time_str = dt_utc.strftime('%Y%m%dT%H%M%SZ')
+                                target_event_id = f"{master_item_id}_{time_str}"
+                            elif 'date' in orig_time:
+                                d = date.fromisoformat(orig_time['date'])
+                                time_str = d.strftime('%Y%m%d')
+                                target_event_id = f"{master_item_id}_{time_str}"
+                        except Exception as e:
+                            _LOGGER.error("Instance ID computation failed for UID %s: %s", uid, e)
                             
-                # Determine deduplication key
+                    if not target_event_id:
+                        # Missing Master -> Prevent 400 Bad Request by aborting orphaned exception
+                        _LOGGER.warning("Could not find master event for exception UID %s. Skipping.", uid)
+                        api_errors.append({"uid": uid, "error": "Master event not found. Cannot create orphaned exception."})
+                        continue
+                        
+                    # Prevent 400 Bad Request by stripping iCalUID from instance updates
+                    body.pop("iCalUID", None)
+                    
+                else:
+                    target_event_id = master_item_id
+
+                unique_req_id = f"{uid}_{index}" 
                 if target_event_id:
                     resource_key = target_event_id
                 else:
@@ -401,7 +430,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                     if mutation_op:
                         if uid not in uid_operations:
                             uid_operations[uid] = {}
-                        # Overwrites redundant operations targeting the exact same time/event
                         uid_operations[uid][resource_key] = (mutation_op, unique_req_id)
                                 
                 except Exception as e:
@@ -409,13 +437,9 @@ class GoogleCalendarPushView(HomeAssistantView):
                     api_errors.append({"uid": uid, "error": str(e)})
 
             # --- CONFLICT-FREE BATCH EXECUTION ---
-            # Extract the unique operations into lists
             uid_op_lists = {u: list(ops.values()) for u, ops in uid_operations.items()}
-            
-            # Find the highest number of operations required for a single UID
             max_ops = max([len(ops) for ops in uid_op_lists.values()]) if uid_op_lists else 0
 
-            # Execute in passes, pulling at most ONE operation per UID into each batch
             for i in range(max_ops):
                 mutate_batch = service.new_batch_http_request()
                 mutations_added = 0
