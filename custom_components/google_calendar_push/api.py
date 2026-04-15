@@ -17,6 +17,23 @@ from .const import SIGNAL_UPDATE_ENDPOINT
 
 _LOGGER = logging.getLogger(__name__)
 
+# --- FIX: Map Microsoft/Windows Timezones to IANA ---
+WINDOWS_TO_IANA_MAP = {
+    "GMT Standard Time": "Europe/London",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "Mountain Standard Time": "America/Denver",
+    "Central Standard Time": "America/Chicago",
+    "Eastern Standard Time": "America/New_York",
+    "US Eastern Standard Time": "America/Indianapolis",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Prague",
+    "Romance Standard Time": "Europe/Paris",
+    "India Standard Time": "Asia/Calcutta",
+    "China Standard Time": "Asia/Calcutta",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+}
+
 def _parse_rfc9775_datetime(data):
     """Recursively parses RFC 9775 datetime strings into proper timezone-aware Python datetime objects."""
     if isinstance(data, dict):
@@ -35,18 +52,17 @@ def _parse_rfc9775_datetime(data):
         match = re.search(r'^(.*?T\d{2}:\d{2}:\d{2}.*?)\[(.*?)\]$', data)
         if match:
             iso_str = match.group(1)
-            iana_tz_name = match.group(2)
+            raw_tz_name = match.group(2)
+            
+            # Map Windows zones to IANA if necessary
+            iana_tz_name = WINDOWS_TO_IANA_MAP.get(raw_tz_name, raw_tz_name)
             
             try:
-                # --- FIX: Robust RFC 9775 Timezone Parsing ---
-                # Use pytz to resolve the IANA name and accurately localize the naive ISO string.
-                # This ensures the resulting datetime object has the correct UTC offset for Google.
                 naive_dt = datetime.fromisoformat(iso_str.replace('Z', ''))
                 tz_obj = pytz.timezone(iana_tz_name)
                 localized_dt = tz_obj.localize(naive_dt)
                 return localized_dt
             except Exception as e:
-                _LOGGER.warning("RFC 9775 Parsing fallback for %s: %s", data, e)
                 try:
                     return datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
                 except ValueError:
@@ -432,11 +448,18 @@ class GoogleCalendarPushView(HomeAssistantView):
                 for item in items:
                     if "originalStartTime" not in item:
                         master_item_id = item["id"]
+                        # --- FIX: Prevent double-suffixing of ID ---
+                        # If a master ID already contains a virtual instance suffix (e.g. _20260402T213500Z), 
+                        # we must strip it before we compute a new instance suffix below.
+                        if "_" in master_item_id:
+                             master_item_id = master_item_id.split("_")[0]
                         master_item = item
                         break
                         
                 if not master_item_id and uid in newly_created_masters:
                      master_item_id = newly_created_masters[uid]
+                     if "_" in master_item_id:
+                         master_item_id = master_item_id.split("_")[0]
                         
                 target_event_id = None
                 
