@@ -228,7 +228,7 @@ class GoogleCalendarPushView(HomeAssistantView):
         return build("calendar", "v3", credentials=credentials, cache_discovery=False)
 
     def _process_operation(self, service, calendar_id, operation, valid_events_data):
-        from datetime import datetime
+        from datetime import datetime, timedelta
         processed_count = 0
         api_errors = []
 
@@ -251,8 +251,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                             cancel_raw = {
                                 "uid": uid,
                                 "recurrence-id": raw_key,
-                                "dtstart": raw_key, # Fix missing dates on cancelled wrappers
-                                "dtend": raw_key,   # Fix missing dates on cancelled wrappers
+                                "dtstart": raw_key, 
+                                "dtend": raw_key,   
                                 "status": "CANCELLED"
                             }
                             try:
@@ -313,12 +313,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                 else:
                     processed_count += 1
 
-            mutate_batch = service.new_batch_http_request()
-            mutations_added = 0
-            
-            # Use a dictionary to deduplicate mutations acting on the SAME resource 
-            # to prevent Google's "operate on the same resource multiple times" constraint.
-            mutations_to_batch = {}
+            # Map UIDs to their specific operations to prevent lock conflicts
+            uid_operations = {}
 
             for index, (ev, r_ev) in enumerate(events_data):
                 uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
@@ -403,23 +399,39 @@ class GoogleCalendarPushView(HomeAssistantView):
                             continue
                     
                     if mutation_op:
-                        # Safely over-writes previous duplicate operations affecting this specific event
-                        mutations_to_batch[resource_key] = (mutation_op, unique_req_id)
+                        if uid not in uid_operations:
+                            uid_operations[uid] = {}
+                        # Overwrites redundant operations targeting the exact same time/event
+                        uid_operations[uid][resource_key] = (mutation_op, unique_req_id)
                                 
                 except Exception as e:
                     _LOGGER.error("Mutation preparation error for UID %s: %s", uid, e)
                     api_errors.append({"uid": uid, "error": str(e)})
 
-            for res_key, (mut_op, req_id) in mutations_to_batch.items():
-                mutate_batch.add(mut_op, request_id=req_id, callback=mutate_callback)
-                mutations_added += 1
-                    
-            if mutations_added > 0:
-                try:
-                    mutate_batch.execute()
-                except Exception as e:
-                    _LOGGER.error("Batch mutation execution failed: %s", e)
-                    api_errors.append({"error": f"Batch execution failed: {e}"})
+            # --- CONFLICT-FREE BATCH EXECUTION ---
+            # Extract the unique operations into lists
+            uid_op_lists = {u: list(ops.values()) for u, ops in uid_operations.items()}
+            
+            # Find the highest number of operations required for a single UID
+            max_ops = max([len(ops) for ops in uid_op_lists.values()]) if uid_op_lists else 0
+
+            # Execute in passes, pulling at most ONE operation per UID into each batch
+            for i in range(max_ops):
+                mutate_batch = service.new_batch_http_request()
+                mutations_added = 0
+                
+                for u, ops in uid_op_lists.items():
+                    if i < len(ops):
+                        mut_op, req_id = ops[i]
+                        mutate_batch.add(mut_op, request_id=req_id, callback=mutate_callback)
+                        mutations_added += 1
+                        
+                if mutations_added > 0:
+                    try:
+                        mutate_batch.execute()
+                    except Exception as e:
+                        _LOGGER.error("Batch mutation execution failed: %s", e)
+                        api_errors.append({"error": f"Batch execution failed: {e}"})
 
         # Execute Masters first, then Exceptions
         if masters_data:
