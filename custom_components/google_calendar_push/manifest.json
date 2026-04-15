@@ -10,5 +10,5 @@
     "ical>=8.0.0"
   ],
   "iot_class": "cloud_push",
-  "version": "0.0.39"
+  "version": "0.0.40"
 }

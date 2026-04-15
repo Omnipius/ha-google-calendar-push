@@ -4,6 +4,7 @@ import json
 import asyncio
 from datetime import datetime, date, timedelta, timezone
 from aiohttp import web
+import pytz
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -16,7 +17,6 @@ from .const import SIGNAL_UPDATE_ENDPOINT
 
 _LOGGER = logging.getLogger(__name__)
 
-# Map Microsoft/Windows Timezones to standard IANA formats
 WINDOWS_TO_IANA_MAP = {
     "GMT Standard Time": "Europe/London",
     "Pacific Standard Time": "America/Los_Angeles",
@@ -92,6 +92,13 @@ def _get_tz_name_and_dt(dt_obj):
     
     return ha_tz_name, localized_dt
 
+def _format_google_datetime(dt_obj, tz_name):
+    """Format a datetime object for Google API, avoiding duplicate offset/timezone conflicts."""
+    if tz_name and tz_name != "UTC":
+        # If a timezone is specified, Google requires the dateTime string to lack a UTC offset
+        return dt_obj.replace(tzinfo=None).isoformat()
+    return dt_obj.isoformat()
+
 def _convert_ical_to_google(event: Event, raw_event: dict):
     """Strictly map to Google Calendar API format."""
     body = {}
@@ -123,7 +130,7 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         if isinstance(dtstart, datetime):
             tz_name, safe_dtstart = _get_tz_name_and_dt(dtstart)
             body["start"] = {
-                "dateTime": safe_dtstart.isoformat(),
+                "dateTime": _format_google_datetime(safe_dtstart, tz_name),
                 "timeZone": tz_name
             }
         elif isinstance(dtstart, date):
@@ -133,7 +140,7 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         if isinstance(dtend, datetime):
             tz_name, safe_dtend = _get_tz_name_and_dt(dtend)
             body["end"] = {
-                "dateTime": safe_dtend.isoformat(),
+                "dateTime": _format_google_datetime(safe_dtend, tz_name),
                 "timeZone": tz_name
             }
         elif isinstance(dtend, date):
@@ -144,7 +151,7 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         if isinstance(recurrence_id, datetime):
             tz_name, safe_rec_id = _get_tz_name_and_dt(recurrence_id)
             body["originalStartTime"] = {
-                "dateTime": safe_rec_id.isoformat(),
+                "dateTime": _format_google_datetime(safe_rec_id, tz_name),
                 "timeZone": tz_name
             }
         elif isinstance(recurrence_id, date):
@@ -324,6 +331,7 @@ class GoogleCalendarPushView(HomeAssistantView):
         masters_data = []
         exceptions_data = []
         
+        # We process exceptions that are at least 60 days old
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
         
         for event, raw_event in valid_events_data:
@@ -425,9 +433,12 @@ class GoogleCalendarPushView(HomeAssistantView):
                 
                 if exception is not None:
                     error_msg = str(exception)
-                    sent_body = req_id_to_body.get(request_id, {})
-                    _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
-                    api_errors.append({"uid": original_uid, "error": error_msg})
+                    if "404" in error_msg:
+                        _LOGGER.warning("Google API instance not found for UID %s: %s", original_uid, error_msg)
+                    else:
+                        sent_body = req_id_to_body.get(request_id, {})
+                        _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
+                        api_errors.append({"uid": original_uid, "error": error_msg})
                 else:
                     processed_count += 1
                     if not is_exception_pass and response and "id" in response:
@@ -441,20 +452,21 @@ class GoogleCalendarPushView(HomeAssistantView):
                 items = search_results.get(uid, [])
                 body = _convert_ical_to_google(ev, r_ev)
                 
-                # --- FIX: Let Google Manage the Sequence ---
-                body.pop("sequence", None) 
-                
                 master_item_id = None
                 master_item = None
+                
+                # --- FIX: Retrieve Master ID safely by ignoring any existing Virtual Instances ---
+                # A master event is the only event that does NOT have an originalStartTime
                 for item in items:
                     if "originalStartTime" not in item:
-                        # --- FIX: Stop splitting the Master ID ---
                         master_item_id = item["id"]
                         master_item = item
                         break
                         
                 if not master_item_id and uid in newly_created_masters:
                      master_item_id = newly_created_masters[uid]
+                     if "_" in master_item_id:
+                         master_item_id = master_item_id.split("_")[0]
                         
                 target_event_id = None
                 
@@ -471,7 +483,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 
                                 perfect_dt = datetime.combine(o_dt.date(), m_dt.time(), tzinfo=m_dt.tzinfo)
                                 
-                                body["originalStartTime"]["dateTime"] = perfect_dt.isoformat()
+                                body["originalStartTime"]["dateTime"] = _format_google_datetime(perfect_dt, m_tz)
                                 if m_tz:
                                     body["originalStartTime"]["timeZone"] = m_tz
                             except Exception as e:
@@ -529,6 +541,10 @@ class GoogleCalendarPushView(HomeAssistantView):
                     body.pop("recurrence", None) 
                     body.pop("originalStartTime", None)
                     
+                    if body.get("status") == "cancelled" and master_item and "start" in master_item and "end" in master_item:
+                        body["start"] = master_item["start"]
+                        body["end"] = master_item["end"]
+                    
                 else:
                     target_event_id = master_item_id
 
@@ -551,7 +567,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 body.setdefault("status", "confirmed")
                             mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
                         else:
-                            # --- FIX: Standard Insert allows Google to safely auto-assign an ID and sequence! ---
                             mutation_op = service.events().insert(calendarId=calendar_id, body=body)
 
                     elif operation == "update":
