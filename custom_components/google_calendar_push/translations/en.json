@@ -17,11 +17,10 @@
       },
       "aliases": {
         "title": "Set Endpoint Aliases",
-        "description": "Assign a short, custom endpoint name for each selected calendar.\n\nThese will be used in your API URL: `/api/google_calendar_push/<alias>`\n\n**Rules:** Only lowercase letters, numbers, and underscores are allowed."
+        "description": "Assign a short, custom endpoint name for each selected calendar.\n\nThese will be used in your API URL: `/api/google_calendar_push/<alias>`\n\n**Note:** Spaces and special characters will be automatically converted to underscores."
       }
     },
     "error": {
-      "invalid_alias": "Aliases must contain ONLY lowercase letters, numbers, and underscores.",
       "duplicate_alias": "Each calendar must have a unique alias."
     },
     "abort": {
@@ -42,11 +41,10 @@
       },
       "aliases": {
         "title": "Set Endpoint Aliases",
-        "description": "Assign a short, custom endpoint name for each selected calendar.\n\nThese will be used in your API URL: `/api/google_calendar_push/[alias]`\n\n**Rules:** Only lowercase letters, numbers, and underscores are allowed."
+        "description": "Assign a short, custom endpoint name for each selected calendar.\n\nThese will be used in your API URL: `/api/google_calendar_push/<alias>`\n\n**Note:** Spaces and special characters will be automatically converted to underscores."
       }
     },
     "error": {
-      "invalid_alias": "Aliases must contain ONLY lowercase letters, numbers, and underscores.",
       "duplicate_alias": "Each calendar must have a unique alias."
     },
     "abort": {
