@@ -214,6 +214,17 @@ class GoogleCalendarPushView(HomeAssistantView):
     def _process_operation(self, service, calendar_id, operation, valid_events_data):
         processed_count = 0
         api_errors = []
+        search_results = {}
+
+        # --- BATCH 1: Search for all existing events by UID ---
+        def search_callback(request_id, response, exception):
+            if exception is not None:
+                api_errors.append({"uid": request_id, "error": str(exception)})
+            else:
+                search_results[request_id] = response.get("items", [])
+
+        search_batch = service.new_batch_http_request()
+        searches_added = 0
         
         for event, raw_event in valid_events_data:
             uid = getattr(event, "uid", None) or getattr(event, "icaluid", None)
@@ -221,51 +232,101 @@ class GoogleCalendarPushView(HomeAssistantView):
                 api_errors.append({"error": "Missing UID"})
                 continue
                 
+            search_batch.add(
+                service.events().list(calendarId=calendar_id, iCalUID=str(uid), showDeleted=True),
+                request_id=str(uid),
+                callback=search_callback
+            )
+            searches_added += 1
+
+        if searches_added > 0:
+            try:
+                search_batch.execute()
+            except Exception as e:
+                _LOGGER.error("Batch search failed: %s", e)
+                return processed_count, [{"error": f"Batch search failed: {e}"}]
+
+        # --- BATCH 2: Process Add, Update, and Remove Operations ---
+        def mutate_callback(request_id, response, exception):
+            nonlocal processed_count
+            if exception is not None:
+                api_errors.append({"uid": request_id, "error": str(exception)})
+            else:
+                processed_count += 1
+
+        mutate_batch = service.new_batch_http_request()
+        mutations_added = 0
+
+        for event, raw_event in valid_events_data:
+            uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
+            if uid not in search_results:
+                continue # Skip if the search phase encountered an error for this UID
+                
+            items = search_results[uid]
             body = _convert_ical_to_google(event, raw_event)
             
             try:
-                search_result = service.events().list(calendarId=calendar_id, iCalUID=str(uid), showDeleted=True).execute()
-                items = search_result.get("items", [])
-
                 if operation == "add":
                     if items:
                         _LOGGER.info("Event %s already exists. Updating instead.", uid)
                         event_id = items[0]["id"]
                         if items[0].get("status") == "cancelled":
                             body.setdefault("status", "confirmed")
-                        service.events().update(calendarId=calendar_id, eventId=event_id, body=body).execute()
+                        mutate_batch.add(
+                            service.events().update(calendarId=calendar_id, eventId=event_id, body=body),
+                            request_id=uid, callback=mutate_callback
+                        )
                     else:
-                        service.events().insert(calendarId=calendar_id, body=body).execute()
+                        mutate_batch.add(
+                            service.events().insert(calendarId=calendar_id, body=body),
+                            request_id=uid, callback=mutate_callback
+                        )
+                    mutations_added += 1
 
                 elif operation == "update":
                     if not items:
                         _LOGGER.warning("Could not find event with UID %s to update.", uid)
-                        api_errors.append({"uid": str(uid), "error": "Event not found for update"})
+                        api_errors.append({"uid": uid, "error": "Event not found for update"})
                         continue
                     
                     event_id = items[0]["id"]
                     if items[0].get("status") == "cancelled":
                         body.setdefault("status", "confirmed")
-                    service.events().update(calendarId=calendar_id, eventId=event_id, body=body).execute()
+                    mutate_batch.add(
+                        service.events().update(calendarId=calendar_id, eventId=event_id, body=body),
+                        request_id=uid, callback=mutate_callback
+                    )
+                    mutations_added += 1
 
                 elif operation == "remove":
                     if not items:
                         _LOGGER.info("Event %s not found. Gracefully ignoring remove.", uid)
+                        processed_count += 1
                     else:
                         event_id = items[0]["id"]
                         if items[0].get("status") == "cancelled":
                             _LOGGER.info("Event %s already deleted. Gracefully ignoring.", uid)
+                            processed_count += 1
                         else:
-                            service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
-                
-                processed_count += 1
-
+                            mutate_batch.add(
+                                service.events().delete(calendarId=calendar_id, eventId=event_id),
+                                request_id=uid, callback=mutate_callback
+                            )
+                            mutations_added += 1
+                            
             except Exception as e:
-                _LOGGER.error("Error applying %s to event %s: %s", operation, uid, str(e))
-                api_errors.append({"uid": str(uid), "error": str(e)})
+                _LOGGER.error("Error building mutation for event %s: %s", uid, str(e))
+                api_errors.append({"uid": uid, "error": str(e)})
+                
+        if mutations_added > 0:
+            try:
+                mutate_batch.execute()
+            except Exception as e:
+                _LOGGER.error("Batch execution failed: %s", e)
+                api_errors.append({"error": f"Batch execution failed: {e}"})
                 
         return processed_count, api_errors
-
+    
     async def post(self, request, calendar_alias):
         calendar_id = self.calendar_aliases.get(calendar_alias)
         
