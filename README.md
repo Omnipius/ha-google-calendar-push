@@ -9,11 +9,13 @@ Instead of relying on slow polling intervals, this integration opens a dedicated
 
 ## Features
 
+* **High-Performance Batching:** Automatically batches API requests to Google, allowing large payloads to be processed rapidly and efficiently without blocking Home Assistant.
 * **Strict Validation:** Incoming payloads are rigorously validated against the `ical` module using Pydantic.
+* **Recurrence Exceptions:** Intelligently maps `recurrence-id` to `originalStartTime`, allowing you to modify or delete specific instances of a recurring meeting without destroying the master series.
 * **Idempotent Operations:** Automatically intercepts `add` operations for existing events to prevent duplicate calendar entries.
 * **Smart Timezone Handling:** Natively parses RFC 9775 timezone strings (e.g., `[America/Los_Angeles]`) to guarantee perfect Daylight Saving Time transitions.
 * **Graceful Restoration:** Correctly handles soft-deleted (cancelled) Google Calendar events.
-* **Entity Tracking:** Automatically generates Home Assistant Sensor entities for each tracked calendar endpoint to monitor sync statuses and timestamps.
+* **Timestamp Entity Tracking:** Automatically generates Home Assistant `TIMESTAMP` sensors for each tracked calendar, dynamically displaying the exact time of the last successful push and exposing sync statistics.
 
 ## Prerequisites
 
@@ -45,7 +47,7 @@ Before installing this integration, you must configure a Google Cloud Project to
 2. Add a new credential. Select **Google Calendar Push API** and input the Client ID and Secret you generated in Google Cloud.
 3. Return to the Integrations page and click **+ Add Integration**. Search for **Google Calendar Push API**.
 4. You will be redirected to Google to authorize the application. 
-5. Select the calendars you wish to expose and assign a URL-friendly **alias** (lowercase, alphanumeric, underscores) to each.
+5. Select the editable calendars you wish to expose and assign a short, custom alias to each. (Spaces and special characters will be automatically and safely converted to underscores).
 
 ---
 
