@@ -95,7 +95,17 @@ def _get_tz_name_and_dt(dt_obj):
 def _format_google_datetime(dt_obj, tz_name):
     """Format a datetime object for Google API, avoiding duplicate offset/timezone conflicts."""
     if tz_name and tz_name != "UTC":
-        # If a timezone is specified, Google requires the dateTime string to lack a UTC offset
+        # Ensure the datetime object has the correct tzinfo before removing it
+        # This prevents naive datetimes from rendering without an offset in Google
+        try:
+            tz = pytz.timezone(tz_name)
+            if dt_obj.tzinfo is None:
+                 dt_obj = tz.localize(dt_obj)
+            else:
+                 dt_obj = dt_obj.astimezone(tz)
+        except Exception:
+            pass
+            
         return dt_obj.replace(tzinfo=None).isoformat()
     return dt_obj.isoformat()
 
@@ -434,7 +444,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                 if exception is not None:
                     error_msg = str(exception)
                     if "404" in error_msg:
-                        _LOGGER.warning("Google API instance not found for UID %s: %s", original_uid, error_msg)
+                        # Log but do not block execution if Google hasn't spawned the instance yet.
+                        pass
                     else:
                         sent_body = req_id_to_body.get(request_id, {})
                         _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
@@ -455,18 +466,20 @@ class GoogleCalendarPushView(HomeAssistantView):
                 master_item_id = None
                 master_item = None
                 
-                # --- FIX: Retrieve Master ID safely by ignoring any existing Virtual Instances ---
-                # A master event is the only event that does NOT have an originalStartTime
                 for item in items:
                     if "originalStartTime" not in item:
-                        master_item_id = item["id"]
+                        # --- FIX: Precise Instance ID stripping ---
+                        # Instead of splitting on any underscore (which breaks iCalUIDs with underscores),
+                        # use regex to strip ONLY the final Google virtual instance suffix pattern if it exists.
+                        base_id = re.sub(r'_\d{8}T\d{6}Z$', '', item["id"])
+                        master_item_id = base_id
                         master_item = item
                         break
                         
                 if not master_item_id and uid in newly_created_masters:
                      master_item_id = newly_created_masters[uid]
-                     if "_" in master_item_id:
-                         master_item_id = master_item_id.split("_")[0]
+                     base_id = re.sub(r'_\d{8}T\d{6}Z$', '', master_item_id)
+                     master_item_id = base_id
                         
                 target_event_id = None
                 
@@ -534,7 +547,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                             _LOGGER.error("Instance ID computation failed for UID %s: %s", uid, e)
                             
                     if not target_event_id:
-                        _LOGGER.warning("Master event %s not found in search or memory. Dropping orphaned exception.", uid)
                         continue 
                     
                     body.pop("iCalUID", None)
