@@ -52,6 +52,15 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
 
     # 3. Dates
     dtstart = getattr(event, "dtstart", None)
+    dtend = getattr(event, "dtend", None)
+
+    # --- FIX: Prevent "Missing End Time" Errors ---
+    if dtstart and not dtend:
+        if isinstance(dtstart, datetime):
+            dtend = dtstart
+        elif isinstance(dtstart, date):
+            dtend = dtstart + timedelta(days=1)
+
     if dtstart:
         if isinstance(dtstart, datetime):
             tz_name, safe_dtstart = _get_tz_name_and_dt(dtstart)
@@ -62,7 +71,6 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         elif isinstance(dtstart, date):
             body["start"] = {"date": dtstart.isoformat()}
 
-    dtend = getattr(event, "dtend", None)
     if dtend:
         if isinstance(dtend, datetime):
             tz_name, safe_dtend = _get_tz_name_and_dt(dtend)
@@ -117,7 +125,7 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         if recurrence_rules:
             body["recurrence"] = recurrence_rules
 
-    # 6. Alarms - Bypassing Pydantic's silent drop by reading the raw dictionary directly
+    # 6. Alarms
     alarms_list = raw_event.get("valarm") or raw_event.get("alarms") or []
     if alarms_list and isinstance(alarms_list, list):
         overrides = []
@@ -129,9 +137,8 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
             
             trigger = str(alarm_dict.get("trigger", ""))
             clean_trigger = trigger.lstrip('+-')
-            mins = 10 # Fallback default
+            mins = 10 
             
-            # Regex parse the ISO duration string (e.g., PT15M -> 15 mins)
             match = re.match(r'^P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$', clean_trigger)
             if match:
                 weeks = int(match.group(1) or 0)
@@ -140,7 +147,6 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
                 minutes = int(match.group(4) or 0)
                 mins = (weeks * 10080) + (days * 1440) + (hours * 60) + minutes
             elif trigger:
-                # Fallback: Absolute datetime strings. Do the math against dtstart.
                 try:
                     trigger_dt = datetime.fromisoformat(trigger.replace('Z', '+00:00'))
                     if isinstance(dtstart, datetime):
@@ -153,9 +159,7 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
                 except Exception:
                     pass
 
-            # Apply strict Google constraints (Min 0, Max 40320 minutes)
             mins = max(0, min(mins, 40320))
-            
             override_entry = {"method": method, "minutes": mins}
             if override_entry not in overrides:
                 overrides.append(override_entry)
@@ -163,7 +167,7 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         if overrides:
             body["reminders"] = {
                 "useDefault": False,
-                "overrides": overrides[:5] # Google caps at 5 overrides
+                "overrides": overrides[:5] 
             }
 
     # 7. Attendees
@@ -228,30 +232,27 @@ class GoogleCalendarPushView(HomeAssistantView):
         processed_count = 0
         api_errors = []
 
-        # Separate Masters and Exceptions to prevent Batch Race Conditions
         masters_data = []
         exceptions_data = []
         for event, raw_event in valid_events_data:
-            # 1. Legacy Interoperability (Flat lists of exceptions)
             if getattr(event, "recurrence_id", None):
                 exceptions_data.append((event, raw_event))
             else:
                 masters_data.append((event, raw_event))
 
-            # 2. Unpack Nested Exceptions (New Schema)
             exceptions = getattr(event, "exceptions", None)
             if exceptions:
                 raw_exceptions = raw_event.get("exceptions", {})
                 
-                # Zip is safe because Pydantic preserves the JSON dict order
                 if len(exceptions) == len(raw_exceptions):
                     for (exc_key, exc_event), (raw_key, raw_val) in zip(exceptions.items(), raw_exceptions.items()):
                         if exc_event is None:
-                            # Handle Deleted Occurrences (null values)
                             uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
                             cancel_raw = {
                                 "uid": uid,
                                 "recurrence-id": raw_key,
+                                "dtstart": raw_key, # Fix missing dates on cancelled wrappers
+                                "dtend": raw_key,   # Fix missing dates on cancelled wrappers
                                 "status": "CANCELLED"
                             }
                             try:
@@ -260,13 +261,10 @@ class GoogleCalendarPushView(HomeAssistantView):
                             except Exception as e:
                                 _LOGGER.error("Validation failed for cancellation exception: %s", e)
                         else:
-                            # Handle Modified Occurrences
-                            # Ensure we pass the raw dict downstream so alarms can be parsed
                             exceptions_data.append((exc_event, raw_val if isinstance(raw_val, dict) else {}))
                 else:
                     _LOGGER.warning("Mismatch in exceptions dict length for UID %s", getattr(event, "uid", None))
 
-        # Helper function to run a complete batch pass
         def execute_pass(events_data, is_exception_pass):
             nonlocal processed_count
             search_results = {}
@@ -274,19 +272,20 @@ class GoogleCalendarPushView(HomeAssistantView):
             # --- BATCH 1: Search for existing events by UID ---
             def search_callback(request_id, response, exception):
                 if exception is not None:
-                    api_errors.append({"uid": request_id, "error": str(exception)})
+                    error_msg = str(exception)
+                    _LOGGER.error("Google API Search Error for UID %s: %s", request_id, error_msg)
+                    api_errors.append({"uid": request_id, "error": error_msg})
                 else:
                     search_results[request_id] = response.get("items", [])
 
             search_batch = service.new_batch_http_request()
             searches_added = 0
-            seen_uids = set() # Track unique UIDs to prevent duplicate search requests
+            seen_uids = set()
             
             for ev, _ in events_data:
                 uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
                 if not uid or uid in seen_uids:
                     continue
-                
                 seen_uids.add(uid)
                 search_batch.add(
                     service.events().list(calendarId=calendar_id, iCalUID=uid, showDeleted=True),
@@ -299,22 +298,27 @@ class GoogleCalendarPushView(HomeAssistantView):
                 try:
                     search_batch.execute()
                 except Exception as e:
-                    _LOGGER.error("Batch search failed: %s", e)
+                    _LOGGER.error("Batch search execution failed: %s", e)
                     api_errors.append({"error": f"Batch search failed: {e}"})
                     return
 
             # --- BATCH 2: Process Mutations ---
             def mutate_callback(request_id, response, exception):
                 nonlocal processed_count
-                # Strip the index back off to accurately log the original UID in errors
                 original_uid = request_id.rsplit('_', 1)[0] if '_' in request_id else request_id
                 if exception is not None:
-                    api_errors.append({"uid": original_uid, "error": str(exception)})
+                    error_msg = str(exception)
+                    _LOGGER.error("Google API Mutation Error for UID %s: %s", original_uid, error_msg)
+                    api_errors.append({"uid": original_uid, "error": error_msg})
                 else:
                     processed_count += 1
 
             mutate_batch = service.new_batch_http_request()
             mutations_added = 0
+            
+            # Use a dictionary to deduplicate mutations acting on the SAME resource 
+            # to prevent Google's "operate on the same resource multiple times" constraint.
+            mutations_to_batch = {}
 
             for index, (ev, r_ev) in enumerate(events_data):
                 uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
@@ -325,9 +329,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                 body = _convert_ical_to_google(ev, r_ev)
                 
                 target_event_id = None
-                unique_req_id = f"{uid}_{index}" # Generate unique ID to prevent Batch KeyError
+                unique_req_id = f"{uid}_{index}" 
                 
-                # --- STRICT, TIMEZONE-AWARE MATCHING LOGIC ---
                 for item in items:
                     if is_exception_pass:
                         if "originalStartTime" in item:
@@ -337,7 +340,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                             in_dt = in_start.get("dateTime")
                             go_dt = go_start.get("dateTime")
                             
-                            # Safely handle timezone offset string matches (Z vs +00:00)
                             if in_dt and go_dt:
                                 try:
                                     dt1 = datetime.fromisoformat(in_dt.replace('Z', '+00:00'))
@@ -357,59 +359,66 @@ class GoogleCalendarPushView(HomeAssistantView):
                         if "originalStartTime" not in item:
                             target_event_id = item["id"]
                             break
-                
+                            
+                # Determine deduplication key
+                if target_event_id:
+                    resource_key = target_event_id
+                else:
+                    orig_time = body.get("originalStartTime", {})
+                    time_str = orig_time.get("dateTime", orig_time.get("date", "master"))
+                    resource_key = f"insert_{uid}_{time_str}"
+
+                mutation_op = None
                 try:
                     if operation == "add":
                         if target_event_id:
                             target_item = next((i for i in items if i["id"] == target_event_id), {})
                             if target_item.get("status") == "cancelled":
                                 body.setdefault("status", "confirmed")
-                            mutate_batch.add(
-                                service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body),
-                                request_id=unique_req_id, callback=mutate_callback
-                            )
+                            mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
                         else:
-                            mutate_batch.add(
-                                service.events().insert(calendarId=calendar_id, body=body),
-                                request_id=unique_req_id, callback=mutate_callback
-                            )
-                        mutations_added += 1
+                            mutation_op = service.events().insert(calendarId=calendar_id, body=body)
 
                     elif operation == "update":
                         if not target_event_id:
+                            _LOGGER.warning("Could not find event UID %s to update.", uid)
                             api_errors.append({"uid": uid, "error": "Event not found for update"})
                             continue
                         
                         target_item = next((i for i in items if i["id"] == target_event_id), {})
                         if target_item.get("status") == "cancelled":
                             body.setdefault("status", "confirmed")
-                        mutate_batch.add(
-                            service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body),
-                            request_id=unique_req_id, callback=mutate_callback
-                        )
-                        mutations_added += 1
+                        mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
 
                     elif operation == "remove":
                         if target_event_id:
                             target_item = next((i for i in items if i["id"] == target_event_id), {})
                             if target_item.get("status") != "cancelled":
-                                mutate_batch.add(
-                                    service.events().delete(calendarId=calendar_id, eventId=target_event_id),
-                                    request_id=unique_req_id, callback=mutate_callback
-                                )
-                                mutations_added += 1
+                                mutation_op = service.events().delete(calendarId=calendar_id, eventId=target_event_id)
                             else:
                                 processed_count += 1
+                                continue
                         else:
                             processed_count += 1
+                            continue
+                    
+                    if mutation_op:
+                        # Safely over-writes previous duplicate operations affecting this specific event
+                        mutations_to_batch[resource_key] = (mutation_op, unique_req_id)
                                 
                 except Exception as e:
+                    _LOGGER.error("Mutation preparation error for UID %s: %s", uid, e)
                     api_errors.append({"uid": uid, "error": str(e)})
+
+            for res_key, (mut_op, req_id) in mutations_to_batch.items():
+                mutate_batch.add(mut_op, request_id=req_id, callback=mutate_callback)
+                mutations_added += 1
                     
             if mutations_added > 0:
                 try:
                     mutate_batch.execute()
                 except Exception as e:
+                    _LOGGER.error("Batch mutation execution failed: %s", e)
                     api_errors.append({"error": f"Batch execution failed: {e}"})
 
         # Execute Masters first, then Exceptions
