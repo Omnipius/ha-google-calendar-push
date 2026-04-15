@@ -73,6 +73,18 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
         elif isinstance(dtend, date):
             body["end"] = {"date": dtend.isoformat()}
 
+    # 3b. Exceptions to Recurring Events
+    recurrence_id = getattr(event, "recurrence_id", None)
+    if recurrence_id:
+        if isinstance(recurrence_id, datetime):
+            tz_name, safe_rec_id = _get_tz_name_and_dt(recurrence_id)
+            body["originalStartTime"] = {
+                "dateTime": safe_rec_id.isoformat(),
+                "timeZone": tz_name
+            }
+        elif isinstance(recurrence_id, date):
+            body["originalStartTime"] = {"date": recurrence_id.isoformat()}
+
     # 4. Enums
     status = getattr(event, "status", None)
     if status:
@@ -260,20 +272,36 @@ class GoogleCalendarPushView(HomeAssistantView):
         for event, raw_event in valid_events_data:
             uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
             if uid not in search_results:
-                continue # Skip if the search phase encountered an error for this UID
+                continue 
                 
             items = search_results[uid]
             body = _convert_ical_to_google(event, raw_event)
             
+            # --- NEW LOGIC: Distinguish Master vs. Exception ---
+            target_event_id = None
+            is_exception = "originalStartTime" in body
+            
+            for item in items:
+                if is_exception:
+                    # If incoming is an exception, look for the Google event that is also an exception
+                    if "originalStartTime" in item:
+                        # You could optionally compare the exact datetimes here for ultimate safety
+                        target_event_id = item["id"]
+                        break
+                else:
+                    # If incoming is the master, look for the Google event that lacks an originalStartTime
+                    if "originalStartTime" not in item:
+                        target_event_id = item["id"]
+                        break
+            # ---------------------------------------------------
+
             try:
                 if operation == "add":
-                    if items:
+                    if target_event_id:
                         _LOGGER.info("Event %s already exists. Updating instead.", uid)
-                        event_id = items[0]["id"]
-                        if items[0].get("status") == "cancelled":
-                            body.setdefault("status", "confirmed")
+                        # Optional: check if cancelled and restore
                         mutate_batch.add(
-                            service.events().update(calendarId=calendar_id, eventId=event_id, body=body),
+                            service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body),
                             request_id=uid, callback=mutate_callback
                         )
                     else:
