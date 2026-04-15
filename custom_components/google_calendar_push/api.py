@@ -1,40 +1,23 @@
 import logging
 import re
+import time
 from datetime import datetime, date, timedelta, timezone
-from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-import homeassistant.util.dt as dt_util
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
+from aiohttp import web
 
+# Assuming these are your local imports for the integration
 from .ical_patch import Event
-from .const import SIGNAL_UPDATE_ENDPOINT
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-def _get_tz_name_and_dt(dt_obj):
-    """Safely extract an IANA timezone string and return a safe datetime object."""
-    ha_tz = dt_util.DEFAULT_TIME_ZONE
-    ha_tz_name = str(ha_tz)
-
-    if dt_obj.tzinfo is None:
-        return ha_tz_name, dt_obj.replace(tzinfo=ha_tz)
-    
-    if dt_obj.tzinfo == timezone.utc or str(dt_obj.tzinfo) in ["UTC", "GMT", "UTC+00:00"]:
-        return "UTC", dt_obj
-        
-    if hasattr(dt_obj.tzinfo, "key"):
-        return dt_obj.tzinfo.key, dt_obj
-        
-    if hasattr(dt_obj.tzinfo, "zone"):
-        return dt_obj.tzinfo.zone, dt_obj
-        
-    naive_dt = dt_obj.replace(tzinfo=None)
-    localized_dt = naive_dt.replace(tzinfo=ha_tz)
-    
-    return ha_tz_name, localized_dt
+def _get_tz_name_and_dt(dt):
+    """Helper to safely extract the timezone name and datetime object."""
+    if dt.tzinfo is None:
+        return "UTC", dt
+    # Fallback to UTC if tzname is somehow missing
+    return dt.tzinfo.tzname(dt) or "UTC", dt
 
 def _convert_ical_to_google(event: Event, raw_event: dict):
     """Strictly map to Google Calendar API format."""
@@ -54,7 +37,7 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
     dtstart = getattr(event, "dtstart", None)
     dtend = getattr(event, "dtend", None)
 
-    # --- FIX: Prevent "Missing End Time" Errors ---
+    # Prevent "Missing End Time" Errors
     if dtstart and not dtend:
         if isinstance(dtstart, datetime):
             dtend = dtstart
@@ -205,31 +188,59 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
 
     return body
 
+
 class GoogleCalendarPushView(HomeAssistantView):
-    """REST API endpoint for pushing events to Google Calendar."""
-    
-    url = "/api/google_calendar_push/{calendar_alias}"
+    url = "/api/google_calendar_push/{calendar_id}"
     name = "api:google_calendar_push"
     requires_auth = True
 
-    def __init__(self, hass, session, calendar_aliases):
+    def __init__(self, hass, get_service_func):
         self.hass = hass
-        self.session = session
-        self.calendar_aliases = calendar_aliases
+        self.get_service = get_service_func
 
-    def _get_google_service(self):
-        credentials = Credentials(
-            token=self.session.token["access_token"],
-            refresh_token=self.session.token.get("refresh_token"),
-            token_uri=self.session.token.get("token_uri", "https://oauth2.googleapis.com/token"),
-            client_id=self.session.token.get("client_id"),
-            client_secret=self.session.token.get("client_secret"),
+    async def post(self, request: web.Request, calendar_id: str) -> web.Response:
+        """Handle inbound POST requests from the push server."""
+        try:
+            data = await request.json()
+        except Exception:
+            return self.json_message("Invalid JSON", status_code=400)
+
+        operation = data.get("operation")
+        events_payload = data.get("events", [])
+
+        if not operation or operation not in ["add", "update", "remove"]:
+            return self.json_message("Invalid or missing operation", status_code=400)
+
+        if not events_payload or not isinstance(events_payload, list):
+            return self.json_message("Events must be a provided list", status_code=400)
+
+        service = self.get_service(calendar_id)
+        if not service:
+            return self.json_message("Calendar service not found or unauthorized", status_code=404)
+
+        valid_events_data = []
+        for raw_ev in events_payload:
+            try:
+                # Pydantic validation
+                ev_obj = Event.model_validate(raw_ev)
+                valid_events_data.append((ev_obj, raw_ev))
+            except Exception as e:
+                _LOGGER.error("Failed to parse event: %s", e)
+
+        if not valid_events_data:
+            return self.json_message("No valid events to process", status_code=400)
+
+        # Offload the blocking Google API network calls to the executor
+        processed_count, api_errors = await self.hass.async_add_executor_job(
+            self._process_operation, service, calendar_id, operation, valid_events_data
         )
-        return build("calendar", "v3", credentials=credentials, cache_discovery=False)
+
+        if api_errors:
+            return self.json({"processed": processed_count, "errors": api_errors}, status_code=207)
+
+        return self.json({"processed": processed_count, "status": "success"}, status_code=200)
 
     def _process_operation(self, service, calendar_id, operation, valid_events_data):
-        from datetime import datetime, date, timedelta, timezone
-        import time
         processed_count = 0
         api_errors = []
 
@@ -241,11 +252,13 @@ class GoogleCalendarPushView(HomeAssistantView):
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
         
         for event, raw_event in valid_events_data:
+            # 1. Legacy Interoperability (Flat lists of exceptions)
             if getattr(event, "recurrence_id", None):
                 exceptions_data.append((event, raw_event))
             else:
                 masters_data.append((event, raw_event))
 
+            # 2. Unpack Nested Exceptions (New Schema)
             exceptions = getattr(event, "exceptions", None)
             if exceptions:
                 raw_exceptions = raw_event.get("exceptions", {})
@@ -268,6 +281,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                             pass 
                             
                         if exc_event is None:
+                            # Handle Deleted Occurrences (null values)
                             uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
                             cancel_raw = {
                                 "uid": uid,
@@ -282,6 +296,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                             except Exception as e:
                                 _LOGGER.error("Validation failed for cancellation exception: %s", e)
                         else:
+                            # Handle Modified Occurrences
                             exceptions_data.append((exc_event, raw_val if isinstance(raw_val, dict) else {}))
                 else:
                     _LOGGER.warning("Mismatch in exceptions dict length for UID %s", getattr(event, "uid", None))
@@ -289,6 +304,9 @@ class GoogleCalendarPushView(HomeAssistantView):
         def execute_pass(events_data, is_exception_pass):
             nonlocal processed_count
             search_results = {}
+            
+            # In-Memory Map to prevent Master-Index Race Conditions
+            newly_created_masters = {}
             
             def search_callback(request_id, response, exception):
                 if exception is not None:
@@ -310,6 +328,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                         _LOGGER.error("Chunk execution failed: %s", e)
                         api_errors.append({"error": f"Batch chunk failed: {e}"})
 
+            # --- BATCH 1: Search for existing events by UID ---
             search_reqs = []
             seen_uids = set()
             
@@ -324,6 +343,7 @@ class GoogleCalendarPushView(HomeAssistantView):
             if search_reqs:
                 execute_in_chunks(search_reqs, chunk_size=50)
 
+            # --- BATCH 2: Process Mutations ---
             def mutate_callback(request_id, response, exception):
                 nonlocal processed_count
                 original_uid = request_id.rsplit('_', 1)[0] if '_' in request_id else request_id
@@ -333,15 +353,17 @@ class GoogleCalendarPushView(HomeAssistantView):
                     api_errors.append({"uid": original_uid, "error": error_msg})
                 else:
                     processed_count += 1
+                    # CRITICAL: Capture the assigned ID if this was a master event insertion
+                    if not is_exception_pass and response and "id" in response:
+                         newly_created_masters[original_uid] = response["id"]
 
             uid_operations = {}
 
             for index, (ev, r_ev) in enumerate(events_data):
                 uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
-                if uid not in search_results:
-                    continue 
-                    
-                items = search_results[uid]
+                
+                # Fetch search results. If missing, check our newly created masters map!
+                items = search_results.get(uid, [])
                 body = _convert_ical_to_google(ev, r_ev)
                 
                 master_item_id = None
@@ -350,9 +372,14 @@ class GoogleCalendarPushView(HomeAssistantView):
                         master_item_id = item["id"]
                         break
                         
+                # Race Condition Fix: If search didn't find the master, pull it from memory
+                if not master_item_id and uid in newly_created_masters:
+                     master_item_id = newly_created_masters[uid]
+                        
                 target_event_id = None
                 
                 if is_exception_pass:
+                    # 1. Look for explicitly overridden exception
                     for item in items:
                         if "originalStartTime" in item:
                             in_start = body.get("originalStartTime", {})
@@ -376,6 +403,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                                     target_event_id = item["id"]
                                     break
                     
+                    # 2. Compute Virtual Instance ID
                     if not target_event_id and master_item_id:
                         orig_time = body.get("originalStartTime", {})
                         try:
@@ -392,7 +420,9 @@ class GoogleCalendarPushView(HomeAssistantView):
                             _LOGGER.error("Instance ID computation failed for UID %s: %s", uid, e)
                             
                     if not target_event_id:
-                        continue # Drop orphaned exceptions
+                         # Still missing? That means the Master wasn't created. Drop the orphan.
+                        _LOGGER.warning("Master event %s not found in search or memory. Dropping orphaned exception.", uid)
+                        continue 
                         
                     body.pop("iCalUID", None)
                     
@@ -449,7 +479,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                     _LOGGER.error("Mutation preparation error for UID %s: %s", uid, e)
                     api_errors.append({"uid": uid, "error": str(e)})
 
-            # Safely extract ops without conflicts and chunk them into batches of 50
+            # --- CONFLICT-FREE BATCH EXECUTION ---
+            # Extract the unique operations into lists
             uid_op_lists = {u: list(ops.values()) for u, ops in uid_operations.items()}
             max_ops = max([len(ops) for ops in uid_op_lists.values()]) if uid_op_lists else 0
 
@@ -463,85 +494,16 @@ class GoogleCalendarPushView(HomeAssistantView):
                 if mutate_reqs:
                     execute_in_chunks(mutate_reqs, chunk_size=50)
 
+        # Execute Masters first
         if masters_data:
             execute_pass(masters_data, is_exception_pass=False)
+            
+            # Force a micro-sleep to ensure the API has a moment to settle before exceptions fire
+            if exceptions_data:
+                 time.sleep(0.5) 
+                 
+        # Execute Exceptions second 
         if exceptions_data:
             execute_pass(exceptions_data, is_exception_pass=True)
 
         return processed_count, api_errors
-    
-    async def post(self, request, calendar_alias):
-        calendar_id = self.calendar_aliases.get(calendar_alias)
-        
-        if not calendar_id:
-            return web.Response(status=404, text=f"Endpoint alias '{calendar_alias}' is not configured.")
-
-        try:
-            data = await request.json()
-        except ValueError:
-            return web.Response(status=400, text="Invalid JSON payload")
-
-        operation = data.get("operation", "").lower()
-        raw_events = data.get("events", [])
-
-        if operation not in ["add", "update", "remove"]:
-            return web.Response(status=400, text="Invalid operation.")
-        if not isinstance(raw_events, list):
-            return web.Response(status=400, text="'events' must be a list.")
-
-        valid_events_data = []
-        validation_errors = []
-        
-        for raw_event in raw_events:
-            try:
-                validated_event = Event.model_validate(raw_event)
-                valid_events_data.append((validated_event, raw_event))
-            except Exception as e:
-                uid = raw_event.get("uid", "UNKNOWN_UID")
-                _LOGGER.error("Pydantic validation failed for event %s: %s", uid, str(e))
-                validation_errors.append({"uid": uid, "error": f"Validation failed: {str(e)}"})
-
-        if not valid_events_data:
-            return web.json_response({
-                "status": "error",
-                "operation": operation,
-                "events_processed": 0,
-                "target_alias": calendar_alias,
-                "errors": validation_errors
-            }, status=400)
-
-        if not self.session.valid_token:
-            await self.session.async_ensure_token_valid()
-
-        service = await self.hass.async_add_executor_job(self._get_google_service)
-        
-        processed_count, api_errors = await self.hass.async_add_executor_job(
-            self._process_operation, service, calendar_id, operation, valid_events_data
-        )
-
-        all_errors = validation_errors + api_errors
-
-        if processed_count > 0:
-            async_dispatcher_send(
-                self.hass,
-                f"{SIGNAL_UPDATE_ENDPOINT}_{calendar_alias}",
-                operation,
-                processed_count
-            )
-
-        if all_errors:
-            status_code = 207 if processed_count > 0 else 400
-            return web.json_response({
-                "status": "partial_success" if processed_count > 0 else "error",
-                "operation": operation,
-                "events_processed": processed_count,
-                "target_alias": calendar_alias,
-                "errors": all_errors
-            }, status=status_code)
-
-        return web.json_response({
-            "status": "success", 
-            "operation": operation, 
-            "events_processed": processed_count,
-            "target_alias": calendar_alias
-        })
