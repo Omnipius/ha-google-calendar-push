@@ -55,10 +55,16 @@ def _convert_ical_to_google(event: Event, raw_event: dict):
     dtstart = getattr(event, "dtstart", None)
     dtend = getattr(event, "dtend", None)
 
-    # --- FIX: Prevent "Missing End Time" Errors ---
+    # --- FIX: Prevent "Zero Duration" Errors ---
     if dtstart and not dtend:
         if isinstance(dtstart, datetime):
-            dtend = dtstart
+            dtend = dtstart + timedelta(minutes=30)
+        elif isinstance(dtstart, date):
+            dtend = dtstart + timedelta(days=1)
+
+    if dtstart and dtend and dtstart == dtend:
+        if isinstance(dtstart, datetime):
+            dtend = dtstart + timedelta(minutes=30)
         elif isinstance(dtstart, date):
             dtend = dtstart + timedelta(days=1)
 
@@ -238,7 +244,6 @@ class GoogleCalendarPushView(HomeAssistantView):
         exceptions_data = []
         
         # --- PROTECTION 1: Ignore ancient exceptions (older than 60 days)
-        # Prevents Google 404 errors on deeply historical virtual instances.
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
         
         for event, raw_event in valid_events_data:
@@ -264,17 +269,28 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 exc_dt = datetime.fromisoformat(exc_key.replace('Z', '+00:00')).astimezone(timezone.utc)
                                 
                             if exc_dt and exc_dt < cutoff_date:
-                                continue # Safely skip pushing ancient history to Google
+                                continue 
                         except Exception:
                             pass 
                             
                         if exc_event is None:
                             uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
+                            
+                            # --- FIX: Prevent zero-duration cancellation objects ---
+                            end_key = raw_key
+                            try:
+                                if isinstance(raw_key, datetime):
+                                    end_key = raw_key + timedelta(minutes=30)
+                                elif isinstance(raw_key, date):
+                                    end_key = raw_key + timedelta(days=1)
+                            except Exception:
+                                pass
+                                
                             cancel_raw = {
                                 "uid": uid,
                                 "recurrence-id": raw_key,
                                 "dtstart": raw_key, 
-                                "dtend": raw_key,   
+                                "dtend": end_key,   
                                 "status": "CANCELLED"
                             }
                             try:
@@ -290,12 +306,7 @@ class GoogleCalendarPushView(HomeAssistantView):
         def execute_pass(events_data, is_exception_pass):
             nonlocal processed_count
             search_results = {}
-
-            # --- In-Memory Map to prevent Race Conditions ---
-            # Keys are UIDs, Values are the newly assigned Google Event IDs
             newly_created_masters = {}
-            
-            # --- Dictionary to map Request IDs to their JSON bodies for debugging ---
             req_id_to_body = {}
             
             def search_callback(request_id, response, exception):
@@ -304,7 +315,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                 else:
                     search_results[request_id] = response.get("items", [])
 
-            # --- PROTECTION 2: Chunk Execution to honor Google API Rate Limits
             def execute_in_chunks(batch_reqs, chunk_size=50):
                 for i in range(0, len(batch_reqs), chunk_size):
                     chunk = batch_reqs[i:i + chunk_size]
@@ -313,7 +323,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                         batch.add(req, request_id=req_id, callback=cb)
                     try:
                         batch.execute()
-                        time.sleep(0.3) # Micro-backoff to stay under Burst Limits
+                        time.sleep(0.3)
                     except Exception as e:
                         _LOGGER.error("Chunk execution failed: %s", e)
                         api_errors.append({"error": f"Batch chunk failed: {e}"})
@@ -351,7 +361,6 @@ class GoogleCalendarPushView(HomeAssistantView):
             for index, (ev, r_ev) in enumerate(events_data):
                 uid = str(getattr(ev, "uid", None) or getattr(ev, "icaluid", None))
                 
-                # Fetch search results. If missing, check our newly created masters map!
                 items = search_results.get(uid, [])
                 body = _convert_ical_to_google(ev, r_ev)
                 
@@ -363,27 +372,34 @@ class GoogleCalendarPushView(HomeAssistantView):
                         master_item = item
                         break
                         
-                # Race Condition Fix: If search didn't find the master, pull it from memory
                 if not master_item_id and uid in newly_created_masters:
                      master_item_id = newly_created_masters[uid]
                         
                 target_event_id = None
                 
                 if is_exception_pass:
-                    # Help computation by converting offset to master offset
+                    # --- FIX: Master Time Synchronization ---
+                    # To completely prevent Naive DateTime shifting or Outlook drift,
+                    # we extract the date from the exception, but lock the time of day 
+                    # and timezone perfectly to the Master event. 
                     if master_item and "start" in master_item:
-                        master_tz = master_item["start"].get("timeZone")
-                        if master_tz and "originalStartTime" in body and "dateTime" in body["originalStartTime"]:
+                        m_start = master_item["start"].get("dateTime")
+                        m_tz = master_item["start"].get("timeZone")
+                        
+                        if m_start and "originalStartTime" in body and "dateTime" in body["originalStartTime"]:
                             try:
-                                orig_dt_str = body["originalStartTime"]["dateTime"]
-                                dt = datetime.fromisoformat(orig_dt_str.replace('Z', '+00:00'))
-                                tz_obj = dt_util.get_time_zone(master_tz)
-                                if tz_obj:
-                                    dt_local = dt.astimezone(tz_obj)
-                                    body["originalStartTime"]["dateTime"] = dt_local.isoformat()
-                                    body["originalStartTime"]["timeZone"] = master_tz
+                                o_dt_str = body["originalStartTime"]["dateTime"]
+                                o_dt = datetime.fromisoformat(o_dt_str.replace('Z', '+00:00'))
+                                m_dt = datetime.fromisoformat(m_start.replace('Z', '+00:00'))
+                                
+                                perfect_dt = datetime.combine(o_dt.date(), m_dt.time(), tzinfo=m_dt.tzinfo)
+                                
+                                body["originalStartTime"]["dateTime"] = perfect_dt.isoformat()
+                                if m_tz:
+                                    body["originalStartTime"]["timeZone"] = m_tz
                             except Exception as e:
-                                pass
+                                _LOGGER.error("Failed to sync originalStartTime: %s", e)
+                    # -------------------------------------
 
                     # 1. Look for explicitly overridden exception
                     for item in items:
@@ -396,7 +412,11 @@ class GoogleCalendarPushView(HomeAssistantView):
                             if in_dt and go_dt:
                                 try:
                                     dt1 = datetime.fromisoformat(in_dt.replace('Z', '+00:00'))
+                                    if dt1.tzinfo: dt1 = dt1.astimezone(timezone.utc)
+                                    
                                     dt2 = datetime.fromisoformat(go_dt.replace('Z', '+00:00'))
+                                    if dt2.tzinfo: dt2 = dt2.astimezone(timezone.utc)
+                                    
                                     if dt1 == dt2:
                                         target_event_id = item["id"]
                                         break
@@ -426,32 +446,17 @@ class GoogleCalendarPushView(HomeAssistantView):
                             _LOGGER.error("Instance ID computation failed for UID %s: %s", uid, e)
                             
                     if not target_event_id:
-                         # Still missing? That means the Master wasn't created. Drop the orphan.
                         _LOGGER.warning("Master event %s not found in search or memory. Dropping orphaned exception.", uid)
                         continue 
                     
-                    # --- FIX: Prevent 400 Bad Request on Exceptions ---
-                    # Virtual instances cannot contain master properties like iCalUID or recurrence arrays
                     body.pop("iCalUID", None)
                     body.pop("recurrence", None) 
-                    
-                    # --- FIX: Prevent Strict originalStartTime Validation mismatches ---
-                    # Because we are identifying the instance perfectly via the target_event_id in the URL, 
-                    # omitting originalStartTime from the body completely bypasses Google's formatting constraints.
-                    body.pop("originalStartTime", None)
                     
                 else:
                     target_event_id = master_item_id
 
-                # --- FIX: Prevent Zero-Duration Errors on Cancellations ---
-                # Google API strictly rejects events where start == end. 
-                # Cancellations do not require dates, so we pop them completely.
-                if body.get("status") == "cancelled":
-                    body.pop("start", None)
-                    body.pop("end", None)
-
                 unique_req_id = f"{uid}_{index}"
-                req_id_to_body[unique_req_id] = body # Store for error logging
+                req_id_to_body[unique_req_id] = body 
                 
                 if target_event_id:
                     resource_key = target_event_id
@@ -502,7 +507,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                     _LOGGER.error("Mutation preparation error for UID %s: %s", uid, e)
                     api_errors.append({"uid": uid, "error": str(e)})
 
-            # Safely extract ops without conflicts and chunk them into batches of 50
             uid_op_lists = {u: list(ops.values()) for u, ops in uid_operations.items()}
             max_ops = max([len(ops) for ops in uid_op_lists.values()]) if uid_op_lists else 0
 
@@ -516,11 +520,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                 if mutate_reqs:
                     execute_in_chunks(mutate_reqs, chunk_size=50)
 
-        # --- Execution Block ---
         if masters_data:
             execute_pass(masters_data, is_exception_pass=False)
-            
-            # Force a micro-sleep to ensure the API has a moment to settle before exceptions fire
             if exceptions_data:
                  import time
                  time.sleep(0.5) 
