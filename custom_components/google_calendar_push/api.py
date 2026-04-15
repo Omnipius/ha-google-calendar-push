@@ -4,7 +4,6 @@ import json
 import asyncio
 from datetime import datetime, date, timedelta, timezone
 from aiohttp import web
-import pytz
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -17,6 +16,7 @@ from .const import SIGNAL_UPDATE_ENDPOINT
 
 _LOGGER = logging.getLogger(__name__)
 
+# Map Microsoft/Windows Timezones to standard IANA formats
 WINDOWS_TO_IANA_MAP = {
     "GMT Standard Time": "Europe/London",
     "Pacific Standard Time": "America/Los_Angeles",
@@ -51,16 +51,19 @@ def _parse_rfc9775_datetime(data):
         match = re.search(r'^(.*?T\d{2}:\d{2}:\d{2}.*?)\[(.*?)\]$', data)
         if match:
             iso_str = match.group(1)
-            raw_tz_name = match.group(2)
+            raw_tz_name = match.group(2).strip()
             
             iana_tz_name = WINDOWS_TO_IANA_MAP.get(raw_tz_name, raw_tz_name)
             
             try:
                 naive_dt = datetime.fromisoformat(iso_str.replace('Z', ''))
-                tz_obj = pytz.timezone(iana_tz_name)
-                localized_dt = tz_obj.localize(naive_dt)
+                tz_obj = dt_util.get_time_zone(iana_tz_name)
+                if tz_obj is None:
+                    raise ValueError(f"Unrecognized Timezone: {iana_tz_name}")
+                localized_dt = naive_dt.replace(tzinfo=tz_obj)
                 return localized_dt
             except Exception as e:
+                _LOGGER.warning("RFC 9775 Parsing fallback for %s: %s", data, e)
                 try:
                     return datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
                 except ValueError:
@@ -422,12 +425,9 @@ class GoogleCalendarPushView(HomeAssistantView):
                 
                 if exception is not None:
                     error_msg = str(exception)
-                    if "404" in error_msg:
-                        _LOGGER.warning("Google API instance not found for UID %s: %s", original_uid, error_msg)
-                    else:
-                        sent_body = req_id_to_body.get(request_id, {})
-                        _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
-                        api_errors.append({"uid": original_uid, "error": error_msg})
+                    sent_body = req_id_to_body.get(request_id, {})
+                    _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
+                    api_errors.append({"uid": original_uid, "error": error_msg})
                 else:
                     processed_count += 1
                     if not is_exception_pass and response and "id" in response:
@@ -441,20 +441,20 @@ class GoogleCalendarPushView(HomeAssistantView):
                 items = search_results.get(uid, [])
                 body = _convert_ical_to_google(ev, r_ev)
                 
+                # --- FIX: Let Google Manage the Sequence ---
+                body.pop("sequence", None) 
+                
                 master_item_id = None
                 master_item = None
                 for item in items:
                     if "originalStartTime" not in item:
+                        # --- FIX: Stop splitting the Master ID ---
                         master_item_id = item["id"]
-                        if "_" in master_item_id:
-                             master_item_id = master_item_id.split("_")[0]
                         master_item = item
                         break
                         
                 if not master_item_id and uid in newly_created_masters:
                      master_item_id = newly_created_masters[uid]
-                     if "_" in master_item_id:
-                         master_item_id = master_item_id.split("_")[0]
                         
                 target_event_id = None
                 
@@ -529,20 +529,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                     body.pop("recurrence", None) 
                     body.pop("originalStartTime", None)
                     
-                    if body.get("status") == "cancelled" and master_item and "start" in master_item and "end" in master_item:
-                        body["start"] = master_item["start"]
-                        body["end"] = master_item["end"]
-                    
                 else:
                     target_event_id = master_item_id
-                    
-                    # --- FIX: Sequence Management for Google Import ---
-                    # When importing an event, Google requires the sequence number to be 
-                    # greater than or equal to the existing sequence number.
-                    if master_item and "sequence" in master_item:
-                        body["sequence"] = master_item["sequence"] + 1
-                    else:
-                        body["sequence"] = 0
 
                 unique_req_id = f"{uid}_{index}"
                 req_id_to_body[unique_req_id] = body 
@@ -563,7 +551,8 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 body.setdefault("status", "confirmed")
                             mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
                         else:
-                            mutation_op = service.events().import_(calendarId=calendar_id, body=body)
+                            # --- FIX: Standard Insert allows Google to safely auto-assign an ID and sequence! ---
+                            mutation_op = service.events().insert(calendarId=calendar_id, body=body)
 
                     elif operation == "update":
                         if not target_event_id:
