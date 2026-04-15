@@ -73,7 +73,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class GoogleCalendarEndpointSensor(SensorEntity):
     """Representation of a Google Calendar Push Endpoint."""
 
-    # Using standard HA icons
     _attr_icon = "mdi:calendar-arrow-right"
     _attr_has_entity_name = True
     _attr_device_class = SensorDeviceClass.TIMESTAMP
@@ -86,8 +85,8 @@ class GoogleCalendarEndpointSensor(SensorEntity):
         self._attr_name = f"Push Endpoint ({alias})"
         self._attr_unique_id = f"{entry_id}_{alias}"
         
-        # Initial state
-        self._attr_native_value = "listening"
+        # Initial state is empty until data is pushed
+        self._attr_native_value = None
         
         # Build the URL. Google uses standard formatting for web access.
         encoded_cid = calendar_id.replace("@", "%40")
@@ -103,12 +102,9 @@ class GoogleCalendarEndpointSensor(SensorEntity):
             "last_events_processed": 0,
             "last_received": "Never"
         }
-
-        self._attr_native_value = None # <-- Start as None instead of "listening"
         
     async def async_added_to_hass(self):
         """Run when entity about to be added to hass."""
-        # Connect to the dispatcher signal from api.py
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass, 
@@ -121,9 +117,8 @@ class GoogleCalendarEndpointSensor(SensorEntity):
     def _handle_push_update(self, operation, count):
         """Handle a push notification update."""
         self._attr_native_value = dt_util.now()
-
         self._attr_extra_state_attributes["last_operation"] = operation
         self._attr_extra_state_attributes["last_events_processed"] = count
+        self._attr_extra_state_attributes["last_received"] = dt_util.now().isoformat()
         
-        # Tell HA to immediately update the dashboard
         self.async_write_ha_state()

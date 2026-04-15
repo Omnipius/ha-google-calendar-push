@@ -272,34 +272,32 @@ class GoogleCalendarPushView(HomeAssistantView):
         for event, raw_event in valid_events_data:
             uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
             if uid not in search_results:
-                continue 
+                continue # Skip if the search phase encountered an error for this UID
                 
             items = search_results[uid]
             body = _convert_ical_to_google(event, raw_event)
             
-            # --- NEW LOGIC: Distinguish Master vs. Exception ---
+            # --- Distinguish Master vs. Exception ---
             target_event_id = None
             is_exception = "originalStartTime" in body
             
             for item in items:
                 if is_exception:
-                    # If incoming is an exception, look for the Google event that is also an exception
                     if "originalStartTime" in item:
-                        # You could optionally compare the exact datetimes here for ultimate safety
                         target_event_id = item["id"]
                         break
                 else:
-                    # If incoming is the master, look for the Google event that lacks an originalStartTime
                     if "originalStartTime" not in item:
                         target_event_id = item["id"]
                         break
-            # ---------------------------------------------------
-
+            
             try:
                 if operation == "add":
                     if target_event_id:
                         _LOGGER.info("Event %s already exists. Updating instead.", uid)
-                        # Optional: check if cancelled and restore
+                        target_item = next((i for i in items if i["id"] == target_event_id), {})
+                        if target_item.get("status") == "cancelled":
+                            body.setdefault("status", "confirmed")
                         mutate_batch.add(
                             service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body),
                             request_id=uid, callback=mutate_callback
@@ -312,32 +310,32 @@ class GoogleCalendarPushView(HomeAssistantView):
                     mutations_added += 1
 
                 elif operation == "update":
-                    if not items:
+                    if not target_event_id:
                         _LOGGER.warning("Could not find event with UID %s to update.", uid)
                         api_errors.append({"uid": uid, "error": "Event not found for update"})
                         continue
                     
-                    event_id = items[0]["id"]
-                    if items[0].get("status") == "cancelled":
+                    target_item = next((i for i in items if i["id"] == target_event_id), {})
+                    if target_item.get("status") == "cancelled":
                         body.setdefault("status", "confirmed")
                     mutate_batch.add(
-                        service.events().update(calendarId=calendar_id, eventId=event_id, body=body),
+                        service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body),
                         request_id=uid, callback=mutate_callback
                     )
                     mutations_added += 1
 
                 elif operation == "remove":
-                    if not items:
+                    if not target_event_id:
                         _LOGGER.info("Event %s not found. Gracefully ignoring remove.", uid)
                         processed_count += 1
                     else:
-                        event_id = items[0]["id"]
-                        if items[0].get("status") == "cancelled":
+                        target_item = next((i for i in items if i["id"] == target_event_id), {})
+                        if target_item.get("status") == "cancelled":
                             _LOGGER.info("Event %s already deleted. Gracefully ignoring.", uid)
                             processed_count += 1
                         else:
                             mutate_batch.add(
-                                service.events().delete(calendarId=calendar_id, eventId=event_id),
+                                service.events().delete(calendarId=calendar_id, eventId=target_event_id),
                                 request_id=uid, callback=mutate_callback
                             )
                             mutations_added += 1
@@ -354,7 +352,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                 api_errors.append({"error": f"Batch execution failed: {e}"})
                 
         return processed_count, api_errors
-    
+
     async def post(self, request, calendar_alias):
         calendar_id = self.calendar_aliases.get(calendar_alias)
         
@@ -380,7 +378,6 @@ class GoogleCalendarPushView(HomeAssistantView):
         for raw_event in raw_events:
             try:
                 validated_event = Event.model_validate(raw_event)
-                # Pack the validated event and raw dictionary into a tuple
                 valid_events_data.append((validated_event, raw_event))
             except Exception as e:
                 uid = raw_event.get("uid", "UNKNOWN_UID")

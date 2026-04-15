@@ -106,7 +106,6 @@ class OAuth2FlowHandler(
 
     async def async_oauth_create_entry(self, data: dict) -> FlowResult:
         """Create an entry or update existing upon returning from Google OAuth."""
-        # Check if this is a Reauth flow instead of a fresh install
         if self.source == SOURCE_REAUTH:
             return self.async_update_reload_and_abort(
                 self._get_reauth_entry(), data=data
@@ -127,7 +126,6 @@ class OAuth2FlowHandler(
                 pass
 
             if not self.selected_calendars:
-                # If no calendars selected, skip alias mapping
                 return self.async_create_entry(
                     title=self.account_email, 
                     data=self.oauth_data,
@@ -139,7 +137,6 @@ class OAuth2FlowHandler(
             calendar_options = await self.hass.async_add_executor_job(
                 get_calendars_from_google, self.oauth_data["token"]
             )
-            # Store names to generate clean default aliases later
             self.calendar_names = {opt["value"]: opt["label"] for opt in calendar_options}
         except Exception as e:
             _LOGGER.error("Error fetching calendars: %s", e)
@@ -163,29 +160,25 @@ class OAuth2FlowHandler(
         errors = {}
 
         if user_input is not None:
-            aliases = list(user_input.values())
+            # Silently auto-sanitize their inputs on submission!
+            cleaned_input = {
+                cal_id: sanitize_alias(alias) for cal_id, alias in user_input.items()
+            }
+            aliases = list(cleaned_input.values())
             
-            # Check for duplicates
             if len(aliases) != len(set(aliases)):
                 errors["base"] = "duplicate_alias"
             else:
-                # Check regex rules
-                valid = all(ALIAS_REGEX.match(alias) for alias in aliases)
-                if not valid:
-                    errors["base"] = "invalid_alias"
-                else:
-                    # Validated! Flip the dict to { "alias": "calendar_id" } for the API endpoint
-                    alias_mapping = {alias: cal_id for cal_id, alias in user_input.items()}
-                    return self.async_create_entry(
-                        title=self.account_email, 
-                        data=self.oauth_data,
-                        options={
-                            CONF_CALENDARS: self.selected_calendars,
-                            CONF_CALENDAR_ALIASES: alias_mapping
-                        }
-                    )
+                alias_mapping = {alias: cal_id for cal_id, alias in cleaned_input.items()}
+                return self.async_create_entry(
+                    title=self.account_email, 
+                    data=self.oauth_data,
+                    options={
+                        CONF_CALENDARS: self.selected_calendars,
+                        CONF_CALENDAR_ALIASES: alias_mapping
+                    }
+                )
 
-        # Build dynamic schema based on selected calendars
         schema = {}
         for cal_id in self.selected_calendars:
             name = self.calendar_names.get(cal_id, cal_id.split("@")[0])
@@ -257,21 +250,20 @@ class OptionsFlowHandler(OptionsFlow):
         errors = {}
 
         if user_input is not None:
-            aliases = list(user_input.values())
+            cleaned_input = {
+                cal_id: sanitize_alias(alias) for cal_id, alias in user_input.items()
+            }
+            aliases = list(cleaned_input.values())
+            
             if len(aliases) != len(set(aliases)):
                 errors["base"] = "duplicate_alias"
             else:
-                valid = all(ALIAS_REGEX.match(alias) for alias in aliases)
-                if not valid:
-                    errors["base"] = "invalid_alias"
-                else:
-                    alias_mapping = {alias: cal_id for cal_id, alias in user_input.items()}
-                    return self.async_create_entry(title="", data={
-                        CONF_CALENDARS: self.selected_calendars,
-                        CONF_CALENDAR_ALIASES: alias_mapping
-                    })
+                alias_mapping = {alias: cal_id for cal_id, alias in cleaned_input.items()}
+                return self.async_create_entry(title="", data={
+                    CONF_CALENDARS: self.selected_calendars,
+                    CONF_CALENDAR_ALIASES: alias_mapping
+                })
 
-        # Fetch existing aliases so we can pre-fill the inputs if they haven't changed
         existing_mapping = self.config_entry.options.get(CONF_CALENDAR_ALIASES, {})
         reverse_mapping = {cal_id: alias for alias, cal_id in existing_mapping.items()}
 
