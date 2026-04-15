@@ -1,6 +1,6 @@
 # Google Calendar Push API for Home Assistant
 
-![Version](https://img.shields.io/badge/version-0.0.41-blue.svg)
+![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)
 ![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg)
 
 A robust, Pydantic-validated webhook endpoint to receive and sync rich iCalendar (RFC 5545 / RFC 9775) events directly to Google Calendar. 
@@ -9,13 +9,13 @@ Instead of relying on slow polling intervals, this integration opens a dedicated
 
 ## Features
 
-* **High-Performance Batching:** Automatically batches API requests to Google, allowing large payloads to be processed rapidly and efficiently without blocking Home Assistant.
+* **Asynchronous Batch Execution:** Automatically batches API requests to Google in safe, chunked threads. This allows massive historical syncs to be processed rapidly without triggering watchdog timeouts or blocking Home Assistant's main event loop.
 * **Strict Validation:** Incoming payloads are rigorously validated against the `ical` module using Pydantic.
-* **Recurrence Exceptions:** Intelligently maps `recurrence-id` to `originalStartTime`, allowing you to modify or delete specific instances of a recurring meeting without destroying the master series.
-* **Idempotent Operations:** Automatically intercepts `add` operations for existing events to prevent duplicate calendar entries.
-* **Smart Timezone Handling:** Natively parses RFC 9775 timezone strings (e.g., `[America/Los_Angeles]`) to guarantee perfect Daylight Saving Time transitions.
+* **Recurrence Exceptions & Virtual Instances:** Intelligently maps `recurrence-id` to `originalStartTime`, allowing you to modify or delete specific instances of a recurring meeting without destroying the master series or breaking Google's base32hex ID chaining.
+* **Idempotent Operations:** Automatically delegates sequence management to Google and intercepts `add` operations for existing events to prevent duplicate calendar entries.
+* **Smart Timezone Handling:** Natively parses RFC 9775 timezone strings (e.g., `[America/Los_Angeles]`) and seamlessly strips conflicting UTC offsets. Furthermore, it automatically maps proprietary Microsoft Windows Timezone names (e.g., `GMT Standard Time`) to universal IANA standards for flawless Outlook-to-Google syncing.
+* **Zero-Duration Safeguards:** Automatically catches and pads zero-duration exceptions or cancellations lacking end-times to comply with strict Google Calendar API schema requirements.
 * **Graceful Restoration:** Correctly handles soft-deleted (cancelled) Google Calendar events.
-* **Timestamp Entity Tracking:** Automatically generates Home Assistant `TIMESTAMP` sensors for each tracked calendar, dynamically displaying the exact time of the last successful push and exposing sync statistics.
 
 ## Prerequisites
 
@@ -104,4 +104,4 @@ The endpoint expects a JSON payload containing the `operation` (add, update, rem
 
 * **400 Bad Request:** Google Calendar rejects invalid ISO strings or malformed configurations. Check the response body for Google's specific rejection reason.
 * **207 Multi-Status:** Returned if a batch array contains both successful updates and validation failures. The response body will contain an errors array indicating which uid failed.
-* **404 Not Found:** Ensure the alias in your URL exactly matches the alias you configured in the Home Assistant UI.
+* **404 Not Found:** Ensure the alias in your URL exactly matches the alias you configured in the Home Assistant UI. Can also trigger if attempting to update a virtual instance of an event before Google's recurrence engine has finished generating the master series.
