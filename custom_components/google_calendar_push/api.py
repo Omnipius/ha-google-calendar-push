@@ -338,13 +338,11 @@ class GoogleCalendarPushView(HomeAssistantView):
                 
                 if exception is not None:
                     error_msg = str(exception)
-                    # Extract the payload to log exactly what failed
                     sent_body = req_id_to_body.get(request_id, {})
                     _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
                     api_errors.append({"uid": original_uid, "error": error_msg})
                 else:
                     processed_count += 1
-                    # CRITICAL: Capture the assigned ID if this was a master event insertion
                     if not is_exception_pass and response and "id" in response:
                          newly_created_masters[original_uid] = response["id"]
 
@@ -372,11 +370,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                 target_event_id = None
                 
                 if is_exception_pass:
-                    # --- FIX: Strict Timezone Offset Mismatch ---
-                    # Google API requires the exception's originalStartTime.timeZone 
-                    # to match the Master event's start.timeZone. Furthermore, the 
-                    # dateTime string MUST be localized to that specific timezone's 
-                    # offset, or Google rejects the mismatched payload.
+                    # Help computation by converting offset to master offset
                     if master_item and "start" in master_item:
                         master_tz = master_item["start"].get("timeZone")
                         if master_tz and "originalStartTime" in body and "dateTime" in body["originalStartTime"]:
@@ -389,8 +383,7 @@ class GoogleCalendarPushView(HomeAssistantView):
                                     body["originalStartTime"]["dateTime"] = dt_local.isoformat()
                                     body["originalStartTime"]["timeZone"] = master_tz
                             except Exception as e:
-                                _LOGGER.error("Failed to localize originalStartTime: %s", e)
-                    # -------------------------------------
+                                pass
 
                     # 1. Look for explicitly overridden exception
                     for item in items:
@@ -442,8 +435,20 @@ class GoogleCalendarPushView(HomeAssistantView):
                     body.pop("iCalUID", None)
                     body.pop("recurrence", None) 
                     
+                    # --- FIX: Prevent Strict originalStartTime Validation mismatches ---
+                    # Because we are identifying the instance perfectly via the target_event_id in the URL, 
+                    # omitting originalStartTime from the body completely bypasses Google's formatting constraints.
+                    body.pop("originalStartTime", None)
+                    
                 else:
                     target_event_id = master_item_id
+
+                # --- FIX: Prevent Zero-Duration Errors on Cancellations ---
+                # Google API strictly rejects events where start == end. 
+                # Cancellations do not require dates, so we pop them completely.
+                if body.get("status") == "cancelled":
+                    body.pop("start", None)
+                    body.pop("end", None)
 
                 unique_req_id = f"{uid}_{index}"
                 req_id_to_body[unique_req_id] = body # Store for error logging
