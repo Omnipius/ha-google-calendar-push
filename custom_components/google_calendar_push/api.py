@@ -4,6 +4,7 @@ import json
 import asyncio
 from datetime import datetime, date, timedelta, timezone
 from aiohttp import web
+import pytz
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -34,15 +35,22 @@ def _parse_rfc9775_datetime(data):
         match = re.search(r'^(.*?T\d{2}:\d{2}:\d{2}.*?)\[(.*?)\]$', data)
         if match:
             iso_str = match.group(1)
-            iana_tz = match.group(2)
+            iana_tz_name = match.group(2)
+            
             try:
-                dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
-                tz_info = dt_util.get_time_zone(iana_tz)
-                if tz_info:
-                    dt = dt.astimezone(tz_info)
-                return dt
-            except ValueError:
-                return iso_str
+                # --- FIX: Robust RFC 9775 Timezone Parsing ---
+                # Use pytz to resolve the IANA name and accurately localize the naive ISO string.
+                # This ensures the resulting datetime object has the correct UTC offset for Google.
+                naive_dt = datetime.fromisoformat(iso_str.replace('Z', ''))
+                tz_obj = pytz.timezone(iana_tz_name)
+                localized_dt = tz_obj.localize(naive_dt)
+                return localized_dt
+            except Exception as e:
+                _LOGGER.warning("RFC 9775 Parsing fallback for %s: %s", data, e)
+                try:
+                    return datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+                except ValueError:
+                    return iso_str
     return data
 
 def _get_tz_name_and_dt(dt_obj):
@@ -400,8 +408,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                 
                 if exception is not None:
                     error_msg = str(exception)
-                    # --- FIX: Fallback for 404 errors during instance updates ---
-                    # If the instance update fails with a 404, we log it and continue.
                     if "404" in error_msg:
                         _LOGGER.warning("Google API instance not found for UID %s: %s", original_uid, error_msg)
                     else:
@@ -529,8 +535,6 @@ class GoogleCalendarPushView(HomeAssistantView):
                             target_item = next((i for i in items if i["id"] == target_event_id), {})
                             if target_item.get("status") == "cancelled":
                                 body.setdefault("status", "confirmed")
-                            
-                            # --- FIX: Ensure inserting a new exception updates if it exists ---
                             mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
                         else:
                             mutation_op = service.events().insert(calendarId=calendar_id, body=body)
@@ -589,7 +593,7 @@ class GoogleCalendarPushView(HomeAssistantView):
         if masters_data:
             await execute_pass(masters_data, is_exception_pass=False)
             if exceptions_data:
-                 await asyncio.sleep(2.0) # Wait 2 seconds for Google to generate instances
+                 await asyncio.sleep(2.0) 
                  
         if exceptions_data:
             await execute_pass(exceptions_data, is_exception_pass=True)
