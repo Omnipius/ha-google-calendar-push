@@ -1,5 +1,6 @@
 import logging
 import re
+import json
 from datetime import datetime, date, timedelta, timezone
 from aiohttp import web
 
@@ -294,6 +295,9 @@ class GoogleCalendarPushView(HomeAssistantView):
             # Keys are UIDs, Values are the newly assigned Google Event IDs
             newly_created_masters = {}
             
+            # --- Dictionary to map Request IDs to their JSON bodies for debugging ---
+            req_id_to_body = {}
+            
             def search_callback(request_id, response, exception):
                 if exception is not None:
                     api_errors.append({"uid": request_id, "error": str(exception)})
@@ -334,7 +338,9 @@ class GoogleCalendarPushView(HomeAssistantView):
                 
                 if exception is not None:
                     error_msg = str(exception)
-                    _LOGGER.error("Google API Mutation Error for UID %s: %s", original_uid, error_msg)
+                    # Extract the payload to log exactly what failed
+                    sent_body = req_id_to_body.get(request_id, {})
+                    _LOGGER.error("Google API Mutation Error for UID %s: %s | Payload sent: %s", original_uid, error_msg, json.dumps(sent_body))
                     api_errors.append({"uid": original_uid, "error": error_msg})
                 else:
                     processed_count += 1
@@ -439,7 +445,9 @@ class GoogleCalendarPushView(HomeAssistantView):
                 else:
                     target_event_id = master_item_id
 
-                unique_req_id = f"{uid}_{index}" 
+                unique_req_id = f"{uid}_{index}"
+                req_id_to_body[unique_req_id] = body # Store for error logging
+                
                 if target_event_id:
                     resource_key = target_event_id
                 else:
