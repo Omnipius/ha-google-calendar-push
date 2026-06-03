@@ -340,6 +340,7 @@ class GoogleCalendarPushView(HomeAssistantView):
 
         masters_data = []
         exceptions_data = []
+        newly_created_masters = {}
         
         # We process exceptions that are at least 60 days old
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=60)
@@ -352,62 +353,107 @@ class GoogleCalendarPushView(HomeAssistantView):
 
             exceptions = getattr(event, "exceptions", None)
             if exceptions:
-                raw_exceptions = raw_event.get("exceptions", {})
+                raw_exceptions = raw_event.get("exceptions", {}) or {}
                 
-                if len(exceptions) == len(raw_exceptions):
-                    for (exc_key, exc_event), (raw_key, raw_val) in zip(exceptions.items(), raw_exceptions.items()):
-                        
-                        try:
-                            exc_dt = None
-                            if isinstance(exc_key, datetime):
-                                exc_dt = exc_key.astimezone(timezone.utc)
-                            elif isinstance(exc_key, date):
-                                exc_dt = datetime.combine(exc_key, datetime.min.time(), tzinfo=timezone.utc)
-                            elif isinstance(exc_key, str):
-                                clean_key = re.sub(r'\[.*?\]$', '', exc_key)
-                                exc_dt = datetime.fromisoformat(clean_key.replace('Z', '+00:00')).astimezone(timezone.utc)
-                                
-                            if exc_dt and exc_dt < cutoff_date:
-                                continue 
-                        except Exception:
-                            pass 
-                            
-                        if exc_event is None:
-                            uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
-                            
-                            end_key = raw_key
+                # Resolve the master timezone for localizing cancelled exceptions
+                tz_name = None
+                if event.dtstart and isinstance(event.dtstart, datetime):
+                    tz_name, _ = _get_tz_name_and_dt(event.dtstart)
+
+                for exc_key, exc_event in exceptions.items():
+                    # Find matching raw_val and raw key by parsing/comparing keys
+                    r_key = None
+                    raw_val = {}
+                    for k_raw, v_raw in raw_exceptions.items():
+                        match = False
+                        if k_raw == exc_key:
+                            match = True
+                        else:
                             try:
-                                if isinstance(raw_key, datetime):
-                                    end_key = raw_key + timedelta(minutes=30)
-                                elif isinstance(raw_key, date):
-                                    end_key = raw_key + timedelta(days=1)
-                                elif isinstance(raw_key, str):
-                                    rk_dt = datetime.fromisoformat(re.sub(r'\[.*?\]$', '', raw_key).replace('Z', '+00:00'))
-                                    end_key = (rk_dt + timedelta(minutes=30)).isoformat()
+                                if isinstance(exc_key, datetime):
+                                    if datetime.fromisoformat(k_raw.replace('Z', '+00:00')) == exc_key:
+                                        match = True
+                                elif isinstance(exc_key, date):
+                                    if date.fromisoformat(k_raw) == exc_key:
+                                        match = True
                             except Exception:
                                 pass
-                                
-                            cancel_raw = {
-                                "uid": uid,
-                                "recurrence-id": raw_key,
-                                "dtstart": raw_key, 
-                                "dtend": end_key,   
-                                "status": "CANCELLED"
-                            }
-                            try:
-                                cancel_event = Event.model_validate(cancel_raw)
-                                exceptions_data.append((cancel_event, cancel_raw))
-                            except Exception as e:
-                                _LOGGER.error("Validation failed for cancellation exception: %s", e)
-                        else:
-                            exceptions_data.append((exc_event, raw_val if isinstance(raw_val, dict) else {}))
-                else:
-                    _LOGGER.warning("Mismatch in exceptions dict length for UID %s", getattr(event, "uid", None))
+                        if match:
+                            r_key = k_raw
+                            raw_val = v_raw if isinstance(v_raw, dict) else {}
+                            break
+                    
+                    if r_key is None:
+                        # Fallback if no matching raw key was found
+                        r_key = exc_key.isoformat() if hasattr(exc_key, "isoformat") else str(exc_key)
+
+                    try:
+                        exc_dt = None
+                        if isinstance(exc_key, datetime):
+                            exc_dt = exc_key.astimezone(timezone.utc)
+                        elif isinstance(exc_key, date):
+                            exc_dt = datetime.combine(exc_key, datetime.min.time(), tzinfo=timezone.utc)
+                        elif isinstance(exc_key, str):
+                            clean_key = re.sub(r'\[.*?\]$', '', exc_key)
+                            exc_dt = datetime.fromisoformat(clean_key.replace('Z', '+00:00')).astimezone(timezone.utc)
+                            
+                        if exc_dt and exc_dt < cutoff_date:
+                            continue 
+                    except Exception:
+                        pass 
+
+                    if exc_event is None:
+                        uid = str(getattr(event, "uid", None) or getattr(event, "icaluid", None))
+                        
+                        r_key_str = r_key
+                        if isinstance(r_key_str, datetime):
+                            r_key_str = r_key_str.isoformat()
+                        elif isinstance(r_key_str, date):
+                            r_key_str = r_key_str.isoformat()
+
+                        # Ensure the raw key is localized with the master timezone if naive
+                        if tz_name and "T" in r_key_str and "[" not in r_key_str:
+                            r_key_str = re.sub(r'(Z|[+-]\d{2}:\d{2})$', '', r_key_str)
+                            r_key_str = f"{r_key_str}[{tz_name}]"
+
+                        end_key_str = r_key_str
+                        try:
+                            if isinstance(r_key, datetime):
+                                end_key_dt = r_key + timedelta(minutes=30)
+                                end_key_str = end_key_dt.isoformat()
+                            elif isinstance(r_key, date):
+                                end_key_dt = r_key + timedelta(days=1)
+                                end_key_str = end_key_dt.isoformat()
+                            elif isinstance(r_key, str):
+                                rk_dt = datetime.fromisoformat(re.sub(r'\[.*?\]$', '', r_key).replace('Z', '+00:00'))
+                                end_key_dt = rk_dt + timedelta(minutes=30)
+                                end_key_str = end_key_dt.isoformat()
+                        except Exception:
+                            pass
+
+                        if tz_name and "T" in end_key_str and "[" not in end_key_str:
+                            end_key_str = re.sub(r'(Z|[+-]\d{2}:\d{2})$', '', end_key_str)
+                            end_key_str = f"{end_key_str}[{tz_name}]"
+
+                        cancel_raw = {
+                            "uid": uid,
+                            "recurrence-id": r_key_str,
+                            "dtstart": r_key_str, 
+                            "dtend": end_key_str,   
+                            "status": "CANCELLED"
+                        }
+                        try:
+                            cancel_event = Event.model_validate(cancel_raw)
+                            exceptions_data.append((cancel_event, cancel_raw))
+                        except Exception as e:
+                            _LOGGER.error("Validation failed for cancellation exception: %s", e)
+                    else:
+                        exceptions_data.append((exc_event, raw_val))
 
         async def execute_pass(events_data, is_exception_pass):
             nonlocal processed_count
+            nonlocal newly_created_masters
             search_results = {}
-            newly_created_masters = {}
             req_id_to_body = {}
             
             def search_callback(request_id, response, exception):
@@ -513,16 +559,26 @@ class GoogleCalendarPushView(HomeAssistantView):
                                 try:
                                     dt1_str = re.sub(r'\[.*?\]$', '', in_dt)
                                     dt1 = datetime.fromisoformat(dt1_str.replace('Z', '+00:00'))
+                                    if dt1.tzinfo is None:
+                                        in_tz = in_start.get("timeZone")
+                                        if in_tz:
+                                            tz = dt_util.get_time_zone(in_tz)
+                                            if tz: dt1 = dt1.replace(tzinfo=tz)
                                     if dt1.tzinfo: dt1 = dt1.astimezone(timezone.utc)
                                     
                                     dt2_str = re.sub(r'\[.*?\]$', '', go_dt)
                                     dt2 = datetime.fromisoformat(dt2_str.replace('Z', '+00:00'))
+                                    if dt2.tzinfo is None:
+                                        go_tz = go_start.get("timeZone")
+                                        if go_tz:
+                                            tz = dt_util.get_time_zone(go_tz)
+                                            if tz: dt2 = dt2.replace(tzinfo=tz)
                                     if dt2.tzinfo: dt2 = dt2.astimezone(timezone.utc)
                                     
                                     if dt1 == dt2:
                                         target_event_id = item["id"]
                                         break
-                                except ValueError:
+                                except (ValueError, TypeError):
                                     if in_dt == go_dt:
                                         target_event_id = item["id"]
                                         break
@@ -535,7 +591,18 @@ class GoogleCalendarPushView(HomeAssistantView):
                         orig_time = body.get("originalStartTime", {})
                         try:
                             if 'dateTime' in orig_time:
-                                dt = datetime.fromisoformat(orig_time['dateTime'].replace('Z', '+00:00'))
+                                dt_str = orig_time['dateTime']
+                                tz_name = orig_time.get('timeZone')
+                                dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+                                if dt.tzinfo is None:
+                                    if tz_name:
+                                        tz = dt_util.get_time_zone(tz_name)
+                                        if tz:
+                                            dt = dt.replace(tzinfo=tz)
+                                        else:
+                                            dt = dt.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+                                    else:
+                                        dt = dt.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
                                 dt_utc = dt.astimezone(timezone.utc)
                                 time_str = dt_utc.strftime('%Y%m%dT%H%M%SZ')
                                 target_event_id = f"{master_item_id}_{time_str}"
@@ -582,14 +649,13 @@ class GoogleCalendarPushView(HomeAssistantView):
                             mutation_op = service.events().insert(calendarId=calendar_id, body=body)
 
                     elif operation == "update":
-                        if not target_event_id:
-                            api_errors.append({"uid": uid, "error": "Event not found for update"})
-                            continue
-                        
-                        target_item = next((i for i in items if i["id"] == target_event_id), {})
-                        if target_item.get("status") == "cancelled":
-                            body.setdefault("status", "confirmed")
-                        mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
+                        if target_event_id:
+                            target_item = next((i for i in items if i["id"] == target_event_id), {})
+                            if target_item.get("status") == "cancelled":
+                                body.setdefault("status", "confirmed")
+                            mutation_op = service.events().update(calendarId=calendar_id, eventId=target_event_id, body=body)
+                        else:
+                            mutation_op = service.events().insert(calendarId=calendar_id, body=body)
 
                     elif operation == "remove":
                         if target_event_id:
