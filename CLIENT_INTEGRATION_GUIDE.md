@@ -216,3 +216,229 @@ Every response returns an envelope containing:
 ### D. Target Alias Validation
 - Always populate `"target_alias": "<alias>"` in your request payload matching the URL path `/api/google_calendar_push/<alias>`.
 - The backend verifies that the payload alias matches the route alias, guarding against proxy routing or client configuration mistakes.
+
+---
+
+## 8. Full-Calendar Reconciliation (`replace_all` mode)
+
+For scenarios requiring complete calendar alignment, the backend supports **Schema Version 1 Full-Calendar Reconciliation** using a three-phase session protocol: `begin`, `items` (chunked 1..N), and `finalize`.
+
+In `replace_all` mode, the target calendar is treated as dedicated to this synchronization source. Events present on Google Calendar that were not received in the snapshot are deleted during the atomic finalization cutover, and tombstones are recorded.
+
+```
+       Client                                Backend
+         |                                      |
+         | --- 1. begin (count, digest) ------> | Session opened (supersedes older sessions)
+         | <--- 200 OK (status: open) --------- |
+         |                                      |
+         | --- 2. items seq=1 (events) -------> | Validates & applies chunk
+         | <--- 200 OK (status: receiving) ---- |
+         |                                      |
+         | --- 3. items seq=2 (events) -------> | Contiguous sequence validation
+         | <--- 200 OK (status: receiving) ---- |
+         |                                      |
+         | --- 4. finalize (total, digest) ---> | Preconditions verified;
+         |                                      | Stale events deleted from Google;
+         |                                      | Tombstones created;
+         | <--- 200 OK (status: completed) ---- | Session marked completed
+```
+
+### Phase 1: Begin Session (`phase: "begin"`)
+Initializes a new reconciliation session. If an earlier session was in progress for the same calendar alias, it is automatically marked as `superseded`.
+
+**Request:**
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-snap-01-begin",
+  "idempotency_key": "idemp-snap-01-begin",
+  "target_alias": "work",
+  "snapshot": {
+    "snapshot_id": "snap-2026-09-28-001",
+    "mode": "replace_all",
+    "phase": "begin",
+    "expected_item_count": 42,
+    "expected_uid_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
+```
+
+**Response (HTTP 200):**
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-snap-01-begin",
+  "target_alias": "work",
+  "overall_status": "success",
+  "snapshot": {
+    "snapshot_id": "snap-2026-09-28-001",
+    "mode": "replace_all",
+    "phase": "begin",
+    "status": "open",
+    "expected_item_count": 42,
+    "received_item_count": 0
+  },
+  "results": [],
+  "errors": []
+}
+```
+
+### Phase 2: Ingest Item Chunks (`phase: "items"`)
+Transmits items in one or more contiguous, 1-based sequence chunks (`sequence: 1`, `sequence: 2`, etc.).
+
+**Request:**
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-snap-01-chunk-1",
+  "idempotency_key": "idemp-snap-01-chunk-1",
+  "target_alias": "work",
+  "snapshot": {
+    "snapshot_id": "snap-2026-09-28-001",
+    "mode": "replace_all",
+    "phase": "items",
+    "sequence": 1,
+    "is_final": false
+  },
+  "items": [
+    {
+      "uid": "event-101",
+      "operation": "upsert",
+      "source_revision": "2026-09-28T12:00:00Z",
+      "summary": "Engineering Sync",
+      "dtstart": "2026-09-28T14:00:00Z",
+      "dtend": "2026-09-28T15:00:00Z"
+    }
+  ]
+}
+```
+
+**Response (HTTP 200 or 207):**
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-snap-01-chunk-1",
+  "target_alias": "work",
+  "overall_status": "success",
+  "snapshot": {
+    "snapshot_id": "snap-2026-09-28-001",
+    "mode": "replace_all",
+    "phase": "items",
+    "sequence": 1,
+    "status": "receiving",
+    "expected_item_count": 42,
+    "received_item_count": 1
+  },
+  "events_processed": 1,
+  "results": [
+    {
+      "uid": "event-101",
+      "operation": "upsert",
+      "status": "applied",
+      "source_revision": "2026-09-28T12:00:00Z"
+    }
+  ]
+}
+```
+
+### Phase 3: Finalize & Atomic Cutover (`phase: "finalize"`)
+Instructs the backend to verify completeness and perform cutover deletion of stale events.
+
+**Preconditions checked before deletion:**
+1. Snapshot status is `receiving` or `open`.
+2. Snapshot has not been superseded by a newer session.
+3. Count of unique received UIDs matches `expected_item_count` (and `total_items`).
+4. Canonical SHA-256 digest of received UIDs matches `expected_uid_digest` (and `uid_digest`).
+5. All items in the snapshot succeeded; no unresolved or failed items remain.
+
+**Request:**
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-snap-01-finalize",
+  "idempotency_key": "idemp-snap-01-finalize",
+  "target_alias": "work",
+  "snapshot": {
+    "snapshot_id": "snap-2026-09-28-001",
+    "mode": "replace_all",
+    "phase": "finalize",
+    "total_items": 42,
+    "uid_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
+```
+
+**Response (HTTP 200):**
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-snap-01-finalize",
+  "target_alias": "work",
+  "overall_status": "success",
+  "snapshot": {
+    "snapshot_id": "snap-2026-09-28-001",
+    "mode": "replace_all",
+    "phase": "finalize",
+    "status": "completed",
+    "expected_item_count": 42,
+    "received_item_count": 42
+  },
+  "reconciliation": {
+    "target_total_before": 45,
+    "items_applied": 42,
+    "deleted_count": 3,
+    "target_total_after": 42
+  },
+  "results": [],
+  "errors": []
+}
+```
+
+*Note on Retries*: Re-sending `finalize` on an already-completed snapshot returns HTTP 200 with the completed snapshot state and identical reconciliation counts.
+
+---
+
+### Canonical UID Digest Specification
+
+The UID digest ensures that both client and server agree on the exact set of events ingested before any deletions occur:
+
+1. Deduplicate the UID list.
+2. Sort the unique UIDs lexicographically (standard ASCII sort).
+3. Join them with a newline character (`\n`) without a trailing newline.
+4. Calculate the SHA-256 hexadecimal hash.
+
+```python
+import hashlib
+
+def compute_uid_digest(uids: list[str]) -> str:
+    unique_sorted = sorted(set(uids))
+    content = "\n".join(unique_sorted)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+```
+
+- **Empty snapshot digest** (`expected_item_count: 0`): SHA-256 of empty string `""` -> `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- **Normalization**: The backend automatically strips the optional `sha256:` prefix, lowercases the string, and trims whitespace.
+
+---
+
+### Clearing a Calendar (Empty Snapshot)
+
+To delete all events on a calendar safely:
+1. Send `phase: "begin"` with `expected_item_count: 0` and `expected_uid_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"`.
+2. Skip the `items` phase.
+3. Send `phase: "finalize"` with `total_items: 0` and `uid_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"`.
+4. The backend deletes every event currently on the calendar and returns `deleted_count: N, target_total_after: 0`.
+
+---
+
+### Snapshot Reconciliation Error Codes
+
+| Code | HTTP Status | Description |
+|---|---|---|
+| `SNAPSHOT_NOT_FOUND` | `404` | Specified `snapshot_id` does not exist or has expired. |
+| `SNAPSHOT_INCOMPLETE` | `400` | Count of received items does not match `expected_item_count` or `total_items`. |
+| `SNAPSHOT_DIGEST_MISMATCH` | `400` | Computed SHA-256 digest of received UIDs does not match `expected_uid_digest` or `uid_digest`. |
+| `SNAPSHOT_SEQUENCE_INVALID` | `400` | Sequence chunk is out of order (skipped sequence or duplicate sequence). |
+| `SNAPSHOT_SUPERSEDED` | `409` | A newer snapshot session began for this calendar alias; this session has been invalidated. |
+| `SNAPSHOT_FINALIZE_CONFLICT` | `409` | Finalization blocked because unresolved/failed items remain in the session. |
+

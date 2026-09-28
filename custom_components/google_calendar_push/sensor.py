@@ -106,6 +106,10 @@ class GoogleCalendarEndpointSensor(SensorEntity):
             "last_overall_status": None,
             "last_status_summary": {},
             "tombstones_count": 0,
+            "last_snapshot_id": None,
+            "last_snapshot_phase": None,
+            "last_snapshot_status": None,
+            "last_snapshot_deleted_count": 0,
             "last_received": "Never"
         }
         
@@ -122,6 +126,11 @@ class GoogleCalendarEndpointSensor(SensorEntity):
             try:
                 t_count = await self._storage.get_tombstones_count(self._alias)
                 self._attr_extra_state_attributes["tombstones_count"] = t_count
+                latest_snap = await self._storage.get_latest_snapshot(self._alias)
+                if latest_snap:
+                    self._attr_extra_state_attributes["last_snapshot_id"] = latest_snap.get("snapshot_id")
+                    self._attr_extra_state_attributes["last_snapshot_status"] = latest_snap.get("status")
+                    self._attr_extra_state_attributes["last_snapshot_deleted_count"] = latest_snap.get("deleted_count", 0)
             except Exception:
                 pass
 
@@ -137,6 +146,15 @@ class GoogleCalendarEndpointSensor(SensorEntity):
             self._attr_extra_state_attributes["last_request_id"] = info.get("request_id")
             self._attr_extra_state_attributes["last_overall_status"] = info.get("overall_status")
             
+            if "snapshot_id" in info:
+                self._attr_extra_state_attributes["last_snapshot_id"] = info.get("snapshot_id")
+            if "snapshot_phase" in info:
+                self._attr_extra_state_attributes["last_snapshot_phase"] = info.get("snapshot_phase")
+            if "snapshot_status" in info:
+                self._attr_extra_state_attributes["last_snapshot_status"] = info.get("snapshot_status")
+            if "snapshot_deleted_count" in info:
+                self._attr_extra_state_attributes["last_snapshot_deleted_count"] = info.get("snapshot_deleted_count", 0)
+
             summary = {}
             for r in info.get("results", []):
                 st = r.get("status", "unknown")

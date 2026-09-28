@@ -28,6 +28,21 @@ from .const import (
     CODE_RATE_LIMITED,
     CODE_TARGET_UNAVAILABLE,
     CODE_UNSUPPORTED_RECURRENCE,
+    CODE_SNAPSHOT_NOT_FOUND,
+    CODE_SNAPSHOT_INCOMPLETE,
+    CODE_SNAPSHOT_DIGEST_MISMATCH,
+    CODE_SNAPSHOT_SEQUENCE_INVALID,
+    CODE_SNAPSHOT_SUPERSEDED,
+    CODE_SNAPSHOT_FINALIZE_CONFLICT,
+    SNAPSHOT_MODE_REPLACE_ALL,
+    SNAPSHOT_PHASE_BEGIN,
+    SNAPSHOT_PHASE_ITEMS,
+    SNAPSHOT_PHASE_FINALIZE,
+    SNAPSHOT_STATUS_OPEN,
+    SNAPSHOT_STATUS_RECEIVING,
+    SNAPSHOT_STATUS_COMPLETED,
+    SNAPSHOT_STATUS_SUPERSEDED,
+    SNAPSHOT_STATUS_FAILED,
     HEADER_IDEMPOTENCY_KEY,
     HEADER_REQUEST_ID,
     HEADER_RETRY_AFTER,
@@ -787,6 +802,787 @@ class GoogleCalendarPushView(HomeAssistantView):
                         google_event_id=google_id,
                     )
 
+    async def _process_items_payload(
+        self,
+        calendar_id: str,
+        calendar_alias: str,
+        raw_items: list,
+        top_level_op: str = "",
+    ) -> Tuple[List[dict], int, int, str, int, Optional[int], List[str], List[str], Dict[str, dict]]:
+        """Process a list of event items against Google Calendar and storage."""
+        uid_trackers: Dict[str, dict] = {}
+        for index, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                continue
+
+            # Extract item event dict and fields
+            nested_event = item.get("event") if isinstance(item.get("event"), dict) else None
+            effective_event_dict = nested_event if nested_event is not None else item
+
+            # Determine UID
+            uid = (
+                item.get("uid")
+                or effective_event_dict.get("uid")
+                or item.get("iCalUID")
+                or effective_event_dict.get("iCalUID")
+                or item.get("icaluid")
+                or effective_event_dict.get("icaluid")
+            )
+            if not uid:
+                uid = f"UNKNOWN_UID_{index}"
+
+            uid_str = str(uid)
+
+            # Prevent duplicate UIDs within single request from creating duplicate results
+            if uid_str in uid_trackers:
+                continue
+
+            # Determine item operation
+            raw_op = item.get("operation") or top_level_op
+            raw_op_lower = str(raw_op).lower().strip()
+            if raw_op_lower in ("add", "update", "upsert"):
+                op = OPERATION_UPSERT
+            elif raw_op_lower in ("remove", "delete"):
+                op = OPERATION_REMOVE
+            else:
+                op = raw_op_lower or "unknown"
+
+            # Determine source revision
+            source_rev = (
+                item.get("source_revision")
+                or item.get("source-revision")
+                or effective_event_dict.get("source_revision")
+                or effective_event_dict.get("source-revision")
+            )
+            source_rev_str = str(source_rev).strip() if source_rev is not None else None
+
+            is_removal = op == OPERATION_REMOVE
+
+            uid_trackers[uid_str] = {
+                "uid": uid_str,
+                "operation": op,
+                "source_revision": source_rev_str,
+                "status": None,
+                "code": None,
+                "retryable": None,
+                "message": None,
+                "valid_event": None,
+                "processed_raw_event": effective_event_dict,
+                "is_removal": is_removal,
+            }
+
+            # Validate operation
+            if op not in (OPERATION_UPSERT, OPERATION_REMOVE):
+                uid_trackers[uid_str]["status"] = STATUS_REJECTED
+                uid_trackers[uid_str]["code"] = CODE_INVALID_REQUEST
+                uid_trackers[uid_str]["retryable"] = False
+                uid_trackers[uid_str]["message"] = f"Unsupported operation '{raw_op}'."
+                continue
+
+            # Validate event structure for upserts
+            if not is_removal:
+                try:
+                    val_ev, proc_ev = self._parse_event_item(effective_event_dict)
+                    uid_trackers[uid_str]["valid_event"] = val_ev
+                    uid_trackers[uid_str]["processed_raw_event"] = proc_ev
+                except Exception as e:
+                    _LOGGER.error("Event validation failed for UID %s: %s", uid_str, e)
+                    err_msg = str(e)
+                    code = CODE_UNSUPPORTED_RECURRENCE if "rrule" in err_msg.lower() or "recurrence" in err_msg.lower() else CODE_INVALID_EVENT
+                    uid_trackers[uid_str]["status"] = STATUS_REJECTED
+                    uid_trackers[uid_str]["code"] = code
+                    uid_trackers[uid_str]["retryable"] = False
+                    uid_trackers[uid_str]["message"] = f"Validation failed: {err_msg}"
+
+        # Evaluate revision state and tombstones before Google API mutation
+        for uid_str, tracker in uid_trackers.items():
+            if tracker["status"] is not None:
+                continue
+
+            if self.storage:
+                should_exec, rev_status, rev_msg = await self.storage.check_revision_and_status(
+                    alias=calendar_alias,
+                    uid=uid_str,
+                    incoming_rev=tracker["source_revision"],
+                    incoming_op=tracker["operation"],
+                )
+                if not should_exec:
+                    tracker["status"] = rev_status
+                    tracker["message"] = rev_msg
+
+        # Filter UIDs requiring downstream Google Calendar execution
+        active_uids = [
+            uid_str for uid_str, tracker in uid_trackers.items()
+            if tracker["status"] is None
+        ]
+
+        max_retry_after: Optional[int] = None
+
+        if active_uids:
+            try:
+                if not self.session.valid_token:
+                    await self.session.async_ensure_token_valid()
+                service = await self.hass.async_add_executor_job(self._get_google_service)
+                await self._process_operation(
+                    service=service,
+                    calendar_id=calendar_id,
+                    calendar_alias=calendar_alias,
+                    active_uids=active_uids,
+                    uid_trackers=uid_trackers,
+                )
+            except Exception as e:
+                _LOGGER.error("Downstream execution error: %s", e)
+                code, retryable, msg, ra = _classify_google_error(e)
+                if ra and (max_retry_after is None or ra > max_retry_after):
+                    max_retry_after = ra
+                for uid_str in active_uids:
+                    if uid_trackers[uid_str]["status"] is None:
+                        uid_trackers[uid_str]["status"] = STATUS_RETRYABLE if retryable else STATUS_REJECTED
+                        uid_trackers[uid_str]["code"] = code
+                        uid_trackers[uid_str]["retryable"] = retryable
+                        uid_trackers[uid_str]["message"] = msg
+
+        # Assemble per-UID results
+        results = []
+        success_count = 0
+        failure_count = 0
+        has_rejected = False
+        has_retryable = False
+        failed_uids = []
+        succeeded_uids = []
+
+        for uid_str, tracker in uid_trackers.items():
+            st = tracker["status"] or STATUS_APPLIED
+            res = {
+                "uid": uid_str,
+                "operation": tracker["operation"],
+                "status": st,
+            }
+            if tracker.get("source_revision"):
+                res["source_revision"] = tracker["source_revision"]
+            if tracker.get("code"):
+                res["code"] = tracker["code"]
+            if tracker.get("retryable") is not None:
+                res["retryable"] = tracker["retryable"]
+            if tracker.get("message"):
+                res["message"] = tracker["message"]
+
+            results.append(res)
+
+            if st in (STATUS_APPLIED, STATUS_ALREADY_APPLIED, STATUS_STALE_IGNORED):
+                success_count += 1
+                succeeded_uids.append(uid_str)
+            else:
+                failure_count += 1
+                failed_uids.append(uid_str)
+                if st == STATUS_REJECTED:
+                    has_rejected = True
+                elif st == STATUS_RETRYABLE:
+                    has_retryable = True
+
+            ra = tracker.get("retry_after")
+            if ra and (max_retry_after is None or ra > max_retry_after):
+                max_retry_after = ra
+
+        # Compute overall status
+        if failure_count == 0:
+            overall_status = OVERALL_SUCCESS
+            status_code = 200
+        elif success_count > 0:
+            overall_status = OVERALL_PARTIAL
+            status_code = 207  # Multi-Status
+        else:
+            overall_status = OVERALL_ERROR
+            first_err = next((t for t in uid_trackers.values() if t.get("code")), {})
+            err_code = first_err.get("code")
+            if err_code == CODE_AUTHENTICATION_FAILED:
+                status_code = 401
+            elif err_code == CODE_AUTHORIZATION_FAILED:
+                status_code = 403
+            elif err_code == CODE_RATE_LIMITED:
+                status_code = 429
+            elif err_code == CODE_DOWNSTREAM_TIMEOUT:
+                status_code = 503
+            elif err_code == CODE_INVALID_REQUEST:
+                status_code = 400
+            else:
+                status_code = 422 if has_rejected else 503
+
+        return (
+            results,
+            success_count,
+            failure_count,
+            overall_status,
+            status_code,
+            max_retry_after,
+            failed_uids,
+            succeeded_uids,
+            uid_trackers,
+        )
+
+    async def _handle_snapshot_request(
+        self,
+        request,
+        calendar_alias: str,
+        calendar_id: str,
+        data: dict,
+        request_id: str,
+        idempotency_key: Optional[str],
+        payload_hash: Optional[str],
+        start_time: float,
+    ) -> web.Response:
+        """Handle Schema v1 full-calendar reconciliation snapshot requests."""
+        snapshot = data.get("snapshot")
+        if not isinstance(snapshot, dict):
+            return web.json_response({
+                "schema_version": SCHEMA_VERSION,
+                "request_id": request_id,
+                "target_alias": calendar_alias,
+                "overall_status": OVERALL_ERROR,
+                "events_processed": 0,
+                "results": [],
+                "errors": [{
+                    "code": CODE_INVALID_REQUEST,
+                    "message": "'snapshot' field must be an object.",
+                    "retryable": False
+                }]
+            }, status=400)
+
+        snapshot_id = snapshot.get("snapshot_id")
+        mode = snapshot.get("mode")
+        phase = snapshot.get("phase")
+
+        if not snapshot_id or not isinstance(snapshot_id, str):
+            return web.json_response({
+                "schema_version": SCHEMA_VERSION,
+                "request_id": request_id,
+                "target_alias": calendar_alias,
+                "overall_status": OVERALL_ERROR,
+                "events_processed": 0,
+                "results": [],
+                "errors": [{
+                    "code": CODE_INVALID_REQUEST,
+                    "message": "'snapshot.snapshot_id' is required.",
+                    "retryable": False
+                }]
+            }, status=400)
+
+        if not mode or mode != SNAPSHOT_MODE_REPLACE_ALL:
+            return web.json_response({
+                "schema_version": SCHEMA_VERSION,
+                "request_id": request_id,
+                "target_alias": calendar_alias,
+                "overall_status": OVERALL_ERROR,
+                "snapshot": {"snapshot_id": snapshot_id, "mode": str(mode), "phase": str(phase)},
+                "events_processed": 0,
+                "results": [],
+                "errors": [{
+                    "code": CODE_INVALID_REQUEST,
+                    "message": f"Unsupported snapshot mode '{mode}'. Only '{SNAPSHOT_MODE_REPLACE_ALL}' is supported.",
+                    "retryable": False
+                }]
+            }, status=400)
+
+        if phase not in (SNAPSHOT_PHASE_BEGIN, SNAPSHOT_PHASE_ITEMS, SNAPSHOT_PHASE_FINALIZE):
+            return web.json_response({
+                "schema_version": SCHEMA_VERSION,
+                "request_id": request_id,
+                "target_alias": calendar_alias,
+                "overall_status": OVERALL_ERROR,
+                "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": str(phase)},
+                "events_processed": 0,
+                "results": [],
+                "errors": [{
+                    "code": CODE_INVALID_REQUEST,
+                    "message": f"Invalid snapshot phase '{phase}'. Must be one of 'begin', 'items', 'finalize'.",
+                    "retryable": False
+                }]
+            }, status=400)
+
+        if not self.storage:
+            return web.json_response({
+                "schema_version": SCHEMA_VERSION,
+                "request_id": request_id,
+                "target_alias": calendar_alias,
+                "overall_status": OVERALL_ERROR,
+                "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase},
+                "events_processed": 0,
+                "results": [],
+                "errors": [{
+                    "code": CODE_INTERNAL_ERROR,
+                    "message": "Storage manager unavailable for snapshot session.",
+                    "retryable": False
+                }]
+            }, status=500)
+
+        if phase == SNAPSHOT_PHASE_BEGIN:
+            expected_item_count = snapshot.get("expected_item_count")
+            expected_uid_digest = snapshot.get("expected_uid_digest")
+
+            if expected_item_count is None or not isinstance(expected_item_count, int) or expected_item_count < 0:
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{
+                        "code": CODE_INVALID_REQUEST,
+                        "message": "'snapshot.expected_item_count' must be a non-negative integer.",
+                        "retryable": False
+                    }]
+                }, status=400)
+
+            if not expected_uid_digest or not isinstance(expected_uid_digest, str) or not expected_uid_digest.strip():
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{
+                        "code": CODE_INVALID_REQUEST,
+                        "message": "'snapshot.expected_uid_digest' is required.",
+                        "retryable": False
+                    }]
+                }, status=400)
+
+            snap_record, err_code, err_msg = await self.storage.begin_snapshot(
+                snapshot_id=snapshot_id,
+                alias=calendar_alias,
+                mode=mode,
+                expected_item_count=expected_item_count,
+                expected_uid_digest=expected_uid_digest,
+                request_id=request_id,
+            )
+            if err_code:
+                st_code = 409 if err_code in (CODE_SNAPSHOT_FINALIZE_CONFLICT, CODE_IDEMPOTENCY_CONFLICT) else 400
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{"code": err_code, "message": err_msg, "retryable": False}]
+                }, status=st_code)
+
+            resp_data = {
+                "schema_version": SCHEMA_VERSION,
+                "request_id": request_id,
+                "target_alias": calendar_alias,
+                "overall_status": OVERALL_SUCCESS,
+                "snapshot": {
+                    "snapshot_id": snapshot_id,
+                    "mode": mode,
+                    "phase": phase,
+                    "status": snap_record.get("status", SNAPSHOT_STATUS_OPEN),
+                    "expected_item_count": snap_record.get("expected_item_count", 0),
+                    "received_item_count": len(snap_record.get("received_uids", [])),
+                },
+                "events_processed": 0,
+                "results": [],
+                "errors": [],
+            }
+            if idempotency_key:
+                resp_data["idempotency_key"] = idempotency_key
+                await self.storage.record_idempotency(
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash or "",
+                    target_alias=calendar_alias,
+                    request_id=request_id,
+                    status_code=200,
+                    response_data=resp_data,
+                )
+
+            async_dispatcher_send(
+                self.hass,
+                f"{SIGNAL_UPDATE_ENDPOINT}_{calendar_alias}",
+                {
+                    "operation": "snapshot_begin",
+                    "processed_count": 0,
+                    "request_id": request_id,
+                    "overall_status": OVERALL_SUCCESS,
+                    "snapshot_id": snapshot_id,
+                    "snapshot_phase": phase,
+                    "snapshot_status": snap_record.get("status"),
+                }
+            )
+            return web.json_response(resp_data, status=200)
+
+        elif phase == SNAPSHOT_PHASE_ITEMS:
+            sequence = snapshot.get("sequence")
+            is_final = bool(snapshot.get("is_final", False))
+
+            if sequence is None or not isinstance(sequence, int) or sequence < 1:
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{
+                        "code": CODE_INVALID_REQUEST,
+                        "message": "'snapshot.sequence' must be a positive integer (>= 1).",
+                        "retryable": False
+                    }]
+                }, status=400)
+
+            raw_items = data.get("items") if data.get("items") is not None else data.get("events")
+            if not isinstance(raw_items, list):
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "sequence": sequence, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{
+                        "code": CODE_INVALID_REQUEST,
+                        "message": "Payload must contain an 'items' or 'events' list for items phase.",
+                        "retryable": False
+                    }]
+                }, status=400)
+
+            incoming_uids = []
+            for item in raw_items:
+                if isinstance(item, dict):
+                    nested = item.get("event") if isinstance(item.get("event"), dict) else None
+                    eff = nested if nested is not None else item
+                    u = item.get("uid") or eff.get("uid") or item.get("iCalUID") or eff.get("iCalUID") or item.get("icaluid") or eff.get("icaluid")
+                    if u:
+                        incoming_uids.append(str(u))
+
+            snap_record, err_code, err_msg = await self.storage.validate_items_phase(
+                snapshot_id=snapshot_id,
+                alias=calendar_alias,
+                sequence=sequence,
+                is_final=is_final,
+                incoming_uids=incoming_uids,
+            )
+            if err_code:
+                st_code = 404 if err_code == CODE_SNAPSHOT_NOT_FOUND else (409 if err_code in (CODE_SNAPSHOT_SUPERSEDED, CODE_SNAPSHOT_FINALIZE_CONFLICT) else 400)
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "sequence": sequence, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{"code": err_code, "message": err_msg, "retryable": False}]
+                }, status=st_code)
+
+            (
+                results,
+                success_count,
+                failure_count,
+                overall_status,
+                status_code,
+                max_retry_after,
+                failed_uids,
+                succeeded_uids,
+                uid_trackers,
+            ) = await self._process_items_payload(
+                calendar_id=calendar_id,
+                calendar_alias=calendar_alias,
+                raw_items=raw_items,
+                top_level_op=str(data.get("operation", "")).lower(),
+            )
+
+            updated_snap = await self.storage.record_snapshot_items(
+                snapshot_id=snapshot_id,
+                sequence=sequence,
+                uids=incoming_uids,
+                failed_uids=failed_uids,
+                succeeded_uids=succeeded_uids,
+            )
+
+            resp_data = {
+                "schema_version": SCHEMA_VERSION,
+                "request_id": request_id,
+                "target_alias": calendar_alias,
+                "overall_status": overall_status,
+                "snapshot": {
+                    "snapshot_id": snapshot_id,
+                    "mode": mode,
+                    "phase": phase,
+                    "sequence": sequence,
+                    "status": updated_snap.get("status", SNAPSHOT_STATUS_RECEIVING),
+                    "expected_item_count": updated_snap.get("expected_item_count", 0),
+                    "received_item_count": len(updated_snap.get("received_uids", [])),
+                },
+                "events_processed": success_count,
+                "results": results,
+            }
+            if idempotency_key:
+                resp_data["idempotency_key"] = idempotency_key
+                await self.storage.record_idempotency(
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash or "",
+                    target_alias=calendar_alias,
+                    request_id=request_id,
+                    status_code=status_code,
+                    response_data=resp_data,
+                )
+
+            async_dispatcher_send(
+                self.hass,
+                f"{SIGNAL_UPDATE_ENDPOINT}_{calendar_alias}",
+                {
+                    "operation": "snapshot_items",
+                    "processed_count": success_count,
+                    "request_id": request_id,
+                    "overall_status": overall_status,
+                    "snapshot_id": snapshot_id,
+                    "snapshot_phase": phase,
+                    "snapshot_status": updated_snap.get("status"),
+                }
+            )
+
+            headers = {}
+            if max_retry_after:
+                headers[HEADER_RETRY_AFTER] = str(max_retry_after)
+
+            return web.json_response(resp_data, status=status_code, headers=headers)
+
+        elif phase == SNAPSHOT_PHASE_FINALIZE:
+            total_items = snapshot.get("total_items")
+            uid_digest = snapshot.get("uid_digest")
+
+            if total_items is not None and (not isinstance(total_items, int) or total_items < 0):
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{
+                        "code": CODE_INVALID_REQUEST,
+                        "message": "'snapshot.total_items' must be a non-negative integer.",
+                        "retryable": False
+                    }]
+                }, status=400)
+
+            if uid_digest is not None and not isinstance(uid_digest, str):
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{
+                        "code": CODE_INVALID_REQUEST,
+                        "message": "'snapshot.uid_digest' must be a string.",
+                        "retryable": False
+                    }]
+                }, status=400)
+
+            snap_record, err_code, err_msg = await self.storage.validate_finalize_phase(
+                snapshot_id=snapshot_id,
+                alias=calendar_alias,
+                total_items=total_items,
+                uid_digest=uid_digest,
+            )
+            if err_code:
+                st_code = 404 if err_code == CODE_SNAPSHOT_NOT_FOUND else (409 if err_code in (CODE_SNAPSHOT_SUPERSEDED, CODE_SNAPSHOT_FINALIZE_CONFLICT) else 400)
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {"snapshot_id": snapshot_id, "mode": mode, "phase": phase, "status": SNAPSHOT_STATUS_FAILED},
+                    "events_processed": 0,
+                    "results": [],
+                    "errors": [{"code": err_code, "message": err_msg, "retryable": False}]
+                }, status=st_code)
+
+            # Idempotent replay of already-finalized snapshot
+            if snap_record.get("status") == SNAPSHOT_STATUS_COMPLETED:
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_SUCCESS,
+                    "snapshot": {
+                        "snapshot_id": snapshot_id,
+                        "mode": mode,
+                        "phase": phase,
+                        "status": SNAPSHOT_STATUS_COMPLETED,
+                        "expected_item_count": snap_record.get("expected_item_count", 0),
+                        "received_item_count": len(snap_record.get("received_uids", [])),
+                    },
+                    "reconciliation": {
+                        "target_total_before": snap_record.get("target_total_before", 0),
+                        "items_applied": len(snap_record.get("received_uids", [])),
+                        "deleted_count": snap_record.get("deleted_count", 0),
+                        "target_total_after": snap_record.get("target_total_after", 0),
+                    },
+                    "results": [],
+                    "errors": [],
+                }, status=200)
+
+            # Cutover deletion execution
+            try:
+                if not self.session.valid_token:
+                    await self.session.async_ensure_token_valid()
+                service = await self.hass.async_add_executor_job(self._get_google_service)
+
+                def fetch_all_events():
+                    all_events = []
+                    page_token = None
+                    while True:
+                        req = service.events().list(
+                            calendarId=calendar_id,
+                            singleEvents=False,
+                            showDeleted=False,
+                            maxResults=250,
+                            pageToken=page_token,
+                        )
+                        resp = req.execute()
+                        all_events.extend(resp.get("items", []))
+                        page_token = resp.get("nextPageToken")
+                        if not page_token:
+                            break
+                    return all_events
+
+                existing_events = await self.hass.async_add_executor_job(fetch_all_events)
+                received_set = set(snap_record.get("received_uids", []))
+                target_total_before = len(existing_events)
+
+                events_to_delete = []
+                for ev in existing_events:
+                    ev_uid = ev.get("iCalUID") or ev.get("id")
+                    if ev_uid not in received_set:
+                        events_to_delete.append(ev)
+
+                deleted_count = 0
+                if events_to_delete:
+                    def delete_chunk_sync(chunk):
+                        batch = service.new_batch_http_request()
+                        errors = []
+                        def del_cb(request_id, response, exception):
+                            if exception:
+                                err_str = str(exception)
+                                if "404" not in err_str:
+                                    errors.append(exception)
+                        for ev in chunk:
+                            batch.add(service.events().delete(calendarId=calendar_id, eventId=ev["id"]), callback=del_cb)
+                        batch.execute()
+                        if errors:
+                            raise errors[0]
+
+                    chunk_size = 50
+                    for i in range(0, len(events_to_delete), chunk_size):
+                        chunk = events_to_delete[i:i + chunk_size]
+                        await self.hass.async_add_executor_job(delete_chunk_sync, chunk)
+                        deleted_count += len(chunk)
+
+                    for ev in events_to_delete:
+                        tomb_uid = ev.get("iCalUID") or ev.get("id")
+                        await self.storage.record_event_mutation(
+                            alias=calendar_alias,
+                            uid=tomb_uid,
+                            status="tombstone",
+                            google_event_id=ev.get("id"),
+                        )
+
+                target_total_after = max(0, target_total_before - deleted_count)
+                completed_snap = await self.storage.complete_snapshot(
+                    snapshot_id=snapshot_id,
+                    deleted_count=deleted_count,
+                    target_total_before=target_total_before,
+                    target_total_after=target_total_after,
+                )
+
+                resp_data = {
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_SUCCESS,
+                    "snapshot": {
+                        "snapshot_id": snapshot_id,
+                        "mode": mode,
+                        "phase": phase,
+                        "status": SNAPSHOT_STATUS_COMPLETED,
+                        "expected_item_count": completed_snap.get("expected_item_count", 0),
+                        "received_item_count": len(completed_snap.get("received_uids", [])),
+                    },
+                    "reconciliation": {
+                        "target_total_before": target_total_before,
+                        "items_applied": len(completed_snap.get("received_uids", [])),
+                        "deleted_count": deleted_count,
+                        "target_total_after": target_total_after,
+                    },
+                    "results": [],
+                    "errors": [],
+                }
+                if idempotency_key:
+                    resp_data["idempotency_key"] = idempotency_key
+                    await self.storage.record_idempotency(
+                        idempotency_key=idempotency_key,
+                        payload_hash=payload_hash or "",
+                        target_alias=calendar_alias,
+                        request_id=request_id,
+                        status_code=200,
+                        response_data=resp_data,
+                    )
+
+                async_dispatcher_send(
+                    self.hass,
+                    f"{SIGNAL_UPDATE_ENDPOINT}_{calendar_alias}",
+                    {
+                        "operation": "snapshot_finalize",
+                        "processed_count": len(completed_snap.get("received_uids", [])),
+                        "request_id": request_id,
+                        "overall_status": OVERALL_SUCCESS,
+                        "snapshot_id": snapshot_id,
+                        "snapshot_phase": phase,
+                        "snapshot_status": SNAPSHOT_STATUS_COMPLETED,
+                        "snapshot_deleted_count": deleted_count,
+                    }
+                )
+
+                return web.json_response(resp_data, status=200)
+
+            except Exception as e:
+                _LOGGER.error("Finalize execution error for snapshot %s: %s", snapshot_id, e)
+                code, retryable, msg, ra = _classify_google_error(e)
+                await self.storage.fail_snapshot(snapshot_id, msg)
+                headers = {}
+                if ra:
+                    headers[HEADER_RETRY_AFTER] = str(ra)
+                st_code = 503 if retryable else 500
+                return web.json_response({
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": request_id,
+                    "target_alias": calendar_alias,
+                    "overall_status": OVERALL_ERROR,
+                    "snapshot": {
+                        "snapshot_id": snapshot_id,
+                        "mode": mode,
+                        "phase": phase,
+                        "status": SNAPSHOT_STATUS_FAILED,
+                    },
+                    "errors": [{
+                        "code": code,
+                        "message": msg,
+                        "retryable": retryable,
+                    }],
+                }, status=st_code, headers=headers)
+
     async def post(self, request, calendar_alias: str):
         start_time = time.monotonic()
         calendar_id = self.calendar_aliases.get(calendar_alias)
@@ -879,6 +1675,19 @@ class GoogleCalendarPushView(HomeAssistantView):
                         }]
                     }, status=409)
 
+        # Check if this is a snapshot reconciliation request
+        if "snapshot" in data:
+            return await self._handle_snapshot_request(
+                request=request,
+                calendar_alias=calendar_alias,
+                calendar_id=calendar_id,
+                data=data,
+                request_id=request_id,
+                idempotency_key=idempotency_key,
+                payload_hash=payload_hash,
+                start_time=start_time,
+            )
+
         # Normalize envelope items (supports 'items' or 'events')
         raw_items = data.get("items")
         if raw_items is None:
@@ -901,202 +1710,22 @@ class GoogleCalendarPushView(HomeAssistantView):
 
         top_level_op = str(data.get("operation", "")).lower()
 
-        # Build UID trackers maintaining submission order
-        uid_trackers: Dict[str, dict] = {}
-        for index, item in enumerate(raw_items):
-            if not isinstance(item, dict):
-                continue
-
-            # Extract item event dict and fields
-            nested_event = item.get("event") if isinstance(item.get("event"), dict) else None
-            effective_event_dict = nested_event if nested_event is not None else item
-
-            # Determine UID
-            uid = (
-                item.get("uid")
-                or effective_event_dict.get("uid")
-                or item.get("iCalUID")
-                or effective_event_dict.get("iCalUID")
-                or item.get("icaluid")
-                or effective_event_dict.get("icaluid")
-            )
-            if not uid:
-                uid = f"UNKNOWN_UID_{index}"
-
-            uid_str = str(uid)
-
-            # Prevent duplicate UIDs within single request from creating duplicate results
-            if uid_str in uid_trackers:
-                continue
-
-            # Determine item operation
-            raw_op = item.get("operation") or top_level_op
-            raw_op_lower = str(raw_op).lower().strip()
-            if raw_op_lower in ("add", "update", "upsert"):
-                op = OPERATION_UPSERT
-            elif raw_op_lower in ("remove", "delete"):
-                op = OPERATION_REMOVE
-            else:
-                op = raw_op_lower or "unknown"
-
-            # Determine source revision
-            source_rev = (
-                item.get("source_revision")
-                or item.get("source-revision")
-                or effective_event_dict.get("source_revision")
-                or effective_event_dict.get("source-revision")
-            )
-            source_rev_str = str(source_rev).strip() if source_rev is not None else None
-
-            is_removal = op == OPERATION_REMOVE
-
-            uid_trackers[uid_str] = {
-                "uid": uid_str,
-                "operation": op,
-                "source_revision": source_rev_str,
-                "status": None,
-                "code": None,
-                "retryable": None,
-                "message": None,
-                "valid_event": None,
-                "processed_raw_event": effective_event_dict,
-                "is_removal": is_removal,
-            }
-
-            # Validate operation
-            if op not in (OPERATION_UPSERT, OPERATION_REMOVE):
-                uid_trackers[uid_str]["status"] = STATUS_REJECTED
-                uid_trackers[uid_str]["code"] = CODE_INVALID_REQUEST
-                uid_trackers[uid_str]["retryable"] = False
-                uid_trackers[uid_str]["message"] = f"Unsupported operation '{raw_op}'."
-                continue
-
-            # Validate event structure for upserts
-            if not is_removal:
-                try:
-                    val_ev, proc_ev = self._parse_event_item(effective_event_dict)
-                    uid_trackers[uid_str]["valid_event"] = val_ev
-                    uid_trackers[uid_str]["processed_raw_event"] = proc_ev
-                except Exception as e:
-                    _LOGGER.error("Event validation failed for UID %s: %s", uid_str, e)
-                    err_msg = str(e)
-                    code = CODE_UNSUPPORTED_RECURRENCE if "rrule" in err_msg.lower() or "recurrence" in err_msg.lower() else CODE_INVALID_EVENT
-                    uid_trackers[uid_str]["status"] = STATUS_REJECTED
-                    uid_trackers[uid_str]["code"] = code
-                    uid_trackers[uid_str]["retryable"] = False
-                    uid_trackers[uid_str]["message"] = f"Validation failed: {err_msg}"
-
-        # Evaluate revision state and tombstones before Google API mutation
-        for uid_str, tracker in uid_trackers.items():
-            if tracker["status"] is not None:
-                # Already failed validation
-                continue
-
-            if self.storage:
-                should_exec, rev_status, rev_msg = await self.storage.check_revision_and_status(
-                    alias=calendar_alias,
-                    uid=uid_str,
-                    incoming_rev=tracker["source_revision"],
-                    incoming_op=tracker["operation"],
-                )
-                if not should_exec:
-                    tracker["status"] = rev_status
-                    tracker["message"] = rev_msg
-
-        # Filter UIDs requiring downstream Google Calendar execution
-        active_uids = [
-            uid_str for uid_str, tracker in uid_trackers.items()
-            if tracker["status"] is None
-        ]
-
-        max_retry_after: Optional[int] = None
-
-        if active_uids:
-            try:
-                if not self.session.valid_token:
-                    await self.session.async_ensure_token_valid()
-                service = await self.hass.async_add_executor_job(self._get_google_service)
-                await self._process_operation(
-                    service=service,
-                    calendar_id=calendar_id,
-                    calendar_alias=calendar_alias,
-                    active_uids=active_uids,
-                    uid_trackers=uid_trackers,
-                )
-            except Exception as e:
-                _LOGGER.error("Downstream execution error: %s", e)
-                code, retryable, msg, ra = _classify_google_error(e)
-                if ra and (max_retry_after is None or ra > max_retry_after):
-                    max_retry_after = ra
-                for uid_str in active_uids:
-                    if uid_trackers[uid_str]["status"] is None:
-                        uid_trackers[uid_str]["status"] = STATUS_RETRYABLE if retryable else STATUS_REJECTED
-                        uid_trackers[uid_str]["code"] = code
-                        uid_trackers[uid_str]["retryable"] = retryable
-                        uid_trackers[uid_str]["message"] = msg
-
-        # Assemble per-UID results
-        results = []
-        success_count = 0
-        failure_count = 0
-        has_rejected = False
-        has_retryable = False
-
-        for uid_str, tracker in uid_trackers.items():
-            st = tracker["status"] or STATUS_APPLIED
-            res = {
-                "uid": uid_str,
-                "operation": tracker["operation"],
-                "status": st,
-            }
-            if tracker.get("source_revision"):
-                res["source_revision"] = tracker["source_revision"]
-            if tracker.get("code"):
-                res["code"] = tracker["code"]
-            if tracker.get("retryable") is not None:
-                res["retryable"] = tracker["retryable"]
-            if tracker.get("message"):
-                res["message"] = tracker["message"]
-
-            results.append(res)
-
-            if st in (STATUS_APPLIED, STATUS_ALREADY_APPLIED, STATUS_STALE_IGNORED):
-                success_count += 1
-            else:
-                failure_count += 1
-                if st == STATUS_REJECTED:
-                    has_rejected = True
-                elif st == STATUS_RETRYABLE:
-                    has_retryable = True
-
-            ra = tracker.get("retry_after")
-            if ra and (max_retry_after is None or ra > max_retry_after):
-                max_retry_after = ra
-
-        # Compute overall status
-        if failure_count == 0:
-            overall_status = OVERALL_SUCCESS
-            status_code = 200
-        elif success_count > 0:
-            overall_status = OVERALL_PARTIAL
-            status_code = 207  # Multi-Status
-        else:
-            overall_status = OVERALL_ERROR
-            # Check predominant error code
-            first_err = next((t for t in uid_trackers.values() if t.get("code")), {})
-            err_code = first_err.get("code")
-            if err_code == CODE_AUTHENTICATION_FAILED:
-                status_code = 401
-            elif err_code == CODE_AUTHORIZATION_FAILED:
-                status_code = 403
-            elif err_code == CODE_RATE_LIMITED:
-                status_code = 429
-            elif err_code == CODE_DOWNSTREAM_TIMEOUT:
-                status_code = 503
-            elif err_code == CODE_INVALID_REQUEST:
-                status_code = 400
-            else:
-                status_code = 422 if has_rejected else 503
+        (
+            results,
+            success_count,
+            failure_count,
+            overall_status,
+            status_code,
+            max_retry_after,
+            failed_uids,
+            succeeded_uids,
+            uid_trackers,
+        ) = await self._process_items_payload(
+            calendar_id=calendar_id,
+            calendar_alias=calendar_alias,
+            raw_items=raw_items,
+            top_level_op=top_level_op,
+        )
 
         response_data = {
             "schema_version": SCHEMA_VERSION,

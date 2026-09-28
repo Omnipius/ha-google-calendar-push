@@ -2,9 +2,10 @@
 
 import asyncio
 from datetime import datetime, timezone, timedelta
+import hashlib
 import logging
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -20,6 +21,22 @@ from .const import (
     OPERATION_UPSERT,
     DEFAULT_IDEMPOTENCY_TTL_DAYS,
     DEFAULT_TOMBSTONE_RETENTION_DAYS,
+    DEFAULT_SNAPSHOT_TTL_DAYS,
+    SNAPSHOT_MODE_REPLACE_ALL,
+    SNAPSHOT_STATUS_OPEN,
+    SNAPSHOT_STATUS_RECEIVING,
+    SNAPSHOT_STATUS_COMPLETED,
+    SNAPSHOT_STATUS_SUPERSEDED,
+    SNAPSHOT_STATUS_FAILED,
+    CODE_SNAPSHOT_NOT_FOUND,
+    CODE_SNAPSHOT_INCOMPLETE,
+    CODE_SNAPSHOT_DIGEST_MISMATCH,
+    CODE_SNAPSHOT_SEQUENCE_INVALID,
+    CODE_SNAPSHOT_SUPERSEDED,
+    CODE_SNAPSHOT_FINALIZE_CONFLICT,
+    CODE_IDEMPOTENCY_CONFLICT,
+    CODE_INVALID_REQUEST,
+    CODE_INTERNAL_ERROR,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,6 +104,27 @@ def compare_revisions(rev_a: Optional[str], rev_b: Optional[str]) -> Optional[in
     return 0
 
 
+def normalize_digest(digest: Optional[str]) -> Optional[str]:
+    """Normalize a SHA-256 digest string by stripping prefix and whitespace and lowercasing."""
+    if not digest:
+        return None
+    d = str(digest).strip().lower()
+    if d.startswith("sha256:"):
+        d = d[7:]
+    return d
+
+
+def compute_uid_digest(uids: Any) -> str:
+    """
+    Compute canonical SHA-256 UID digest.
+    Sorted lexicographically, deduplicated, joined by newline (no trailing newline).
+    Empty list produces SHA-256 of empty string (e3b0c442...).
+    """
+    unique_sorted = sorted(set(uids or []))
+    content = "\n".join(unique_sorted)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 class PushStorageManager:
     """Manages persistent idempotency records, event revisions, and tombstones."""
 
@@ -99,6 +137,8 @@ class PushStorageManager:
         self._data: Dict[str, Any] = {
             "idempotency": {},
             "events": {},
+            "snapshots": {},
+            "active_snapshots": {},
         }
         self._loaded = False
 
@@ -110,9 +150,16 @@ class PushStorageManager:
                 self._data = {
                     "idempotency": stored.get("idempotency", {}),
                     "events": stored.get("events", {}),
+                    "snapshots": stored.get("snapshots", {}),
+                    "active_snapshots": stored.get("active_snapshots", {}),
                 }
             else:
-                self._data = {"idempotency": {}, "events": {}}
+                self._data = {
+                    "idempotency": {},
+                    "events": {},
+                    "snapshots": {},
+                    "active_snapshots": {},
+                }
             self._prune_expired_locked()
             self._loaded = True
 
@@ -126,10 +173,11 @@ class PushStorageManager:
         return f"{alias}:{uid}"
 
     def _prune_expired_locked(self) -> None:
-        """Prune expired idempotency receipts and tombstones (must hold lock)."""
+        """Prune expired idempotency receipts, tombstones, and snapshots (must hold lock)."""
         now = datetime.now(timezone.utc)
         idemp_cutoff = now - timedelta(days=DEFAULT_IDEMPOTENCY_TTL_DAYS)
         tombstone_cutoff = now - timedelta(days=DEFAULT_TOMBSTONE_RETENTION_DAYS)
+        snapshot_cutoff = now - timedelta(days=DEFAULT_SNAPSHOT_TTL_DAYS)
 
         # Prune idempotency receipts
         idemp = self._data.get("idempotency", {})
@@ -151,6 +199,21 @@ class PushStorageManager:
                     expired_events.append(key)
         for k in expired_events:
             events.pop(k, None)
+
+        # Prune snapshot sessions
+        snapshots = self._data.get("snapshots", {})
+        expired_snaps = []
+        for sid, snap in snapshots.items():
+            updated_at = parse_iso_datetime(snap.get("updated_at") or snap.get("created_at"))
+            if updated_at and updated_at < snapshot_cutoff:
+                expired_snaps.append(sid)
+        for sid in expired_snaps:
+            snapshots.pop(sid, None)
+
+        active = self._data.get("active_snapshots", {})
+        for alias, sid in list(active.items()):
+            if sid in expired_snaps:
+                active.pop(alias, None)
 
     async def get_idempotency(self, idempotency_key: str) -> Optional[dict]:
         """Retrieve an idempotency receipt if it exists and has not expired."""
@@ -310,3 +373,241 @@ class PushStorageManager:
                     if alias is None or record.get("alias") == alias:
                         count += 1
             return count
+
+    async def begin_snapshot(
+        self,
+        snapshot_id: str,
+        alias: str,
+        mode: str,
+        expected_item_count: int,
+        expected_uid_digest: str,
+        request_id: Optional[str] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+        """
+        Begin or resume a snapshot reconciliation session.
+        Returns: (snapshot_dict, error_code, error_message)
+        """
+        norm_digest = normalize_digest(expected_uid_digest)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        async with self._lock:
+            snapshots = self._data.setdefault("snapshots", {})
+            active_snapshots = self._data.setdefault("active_snapshots", {})
+
+            if snapshot_id in snapshots:
+                existing = snapshots[snapshot_id]
+                # Check for idempotent replay
+                if (
+                    existing.get("alias") == alias
+                    and existing.get("mode") == mode
+                    and existing.get("expected_item_count") == expected_item_count
+                    and existing.get("expected_uid_digest") == norm_digest
+                ):
+                    return existing, None, None
+                return existing, CODE_SNAPSHOT_FINALIZE_CONFLICT, "Snapshot session already exists with different configuration."
+
+            # Mark any currently active snapshot for this alias as superseded
+            active_id = active_snapshots.get(alias)
+            if active_id and active_id in snapshots:
+                active_snap = snapshots[active_id]
+                if active_snap.get("status") in (SNAPSHOT_STATUS_OPEN, SNAPSHOT_STATUS_RECEIVING):
+                    active_snap["status"] = SNAPSHOT_STATUS_SUPERSEDED
+                    active_snap["superseded_by"] = snapshot_id
+                    active_snap["updated_at"] = now_iso
+
+            record = {
+                "snapshot_id": snapshot_id,
+                "alias": alias,
+                "mode": mode,
+                "status": SNAPSHOT_STATUS_OPEN,
+                "expected_item_count": expected_item_count,
+                "expected_uid_digest": norm_digest,
+                "received_uids": [],
+                "unresolved_uids": [],
+                "processed_sequences": [],
+                "superseded_by": None,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+                "completed_at": None,
+                "deleted_count": 0,
+                "target_total_before": 0,
+                "target_total_after": 0,
+                "error": None,
+            }
+            snapshots[snapshot_id] = record
+            active_snapshots[alias] = snapshot_id
+
+        await self.async_save()
+        return record, None, None
+
+    async def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve snapshot record by id."""
+        async with self._lock:
+            return self._data.get("snapshots", {}).get(snapshot_id)
+
+    async def get_active_snapshot(self, alias: str) -> Optional[Dict[str, Any]]:
+        """Retrieve active snapshot record for alias."""
+        async with self._lock:
+            active_id = self._data.get("active_snapshots", {}).get(alias)
+            if active_id:
+                return self._data.get("snapshots", {}).get(active_id)
+            return None
+
+    async def validate_items_phase(
+        self,
+        snapshot_id: str,
+        alias: str,
+        sequence: int,
+        is_final: bool,
+        incoming_uids: List[str],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+        """Validate preconditions for snapshot items phase chunk."""
+        async with self._lock:
+            snap = self._data.get("snapshots", {}).get(snapshot_id)
+            if not snap:
+                return None, CODE_SNAPSHOT_NOT_FOUND, f"Snapshot session '{snapshot_id}' does not exist."
+            if snap.get("alias") != alias:
+                return snap, CODE_INVALID_REQUEST, f"Snapshot session belongs to alias '{snap.get('alias')}', not '{alias}'."
+            if snap.get("status") == SNAPSHOT_STATUS_SUPERSEDED or snap.get("superseded_by"):
+                return snap, CODE_SNAPSHOT_SUPERSEDED, f"Snapshot session has been superseded by '{snap.get('superseded_by')}'."
+            if snap.get("status") == SNAPSHOT_STATUS_COMPLETED:
+                return snap, CODE_SNAPSHOT_FINALIZE_CONFLICT, "Snapshot session has already completed."
+            if snap.get("status") == SNAPSHOT_STATUS_FAILED:
+                return snap, CODE_INTERNAL_ERROR, f"Snapshot session is in failed state: {snap.get('error')}."
+
+            processed_seqs = snap.get("processed_sequences", [])
+            expected_seq = len(processed_seqs) + 1
+            if sequence != expected_seq:
+                return snap, CODE_SNAPSHOT_SEQUENCE_INVALID, f"Expected sequence {expected_seq}, received {sequence}."
+
+            return snap, None, None
+
+    async def record_snapshot_items(
+        self,
+        snapshot_id: str,
+        sequence: int,
+        uids: List[str],
+        failed_uids: Optional[List[str]] = None,
+        succeeded_uids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Record processed items chunk, append unique UIDs, and track unresolved items."""
+        async with self._lock:
+            snap = self._data.get("snapshots", {}).get(snapshot_id)
+            if not snap:
+                raise ValueError(f"Snapshot {snapshot_id} not found")
+            processed_seqs = snap.setdefault("processed_sequences", [])
+            if sequence not in processed_seqs:
+                processed_seqs.append(sequence)
+
+            current_uids = set(snap.get("received_uids", []))
+            current_uids.update(uids)
+            snap["received_uids"] = sorted(list(current_uids))
+
+            unresolved = set(snap.get("unresolved_uids", []))
+            if failed_uids:
+                unresolved.update(failed_uids)
+            if succeeded_uids:
+                unresolved.difference_update(succeeded_uids)
+            snap["unresolved_uids"] = sorted(list(unresolved))
+
+            snap["status"] = SNAPSHOT_STATUS_RECEIVING
+            snap["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await self.async_save()
+        return snap
+
+    async def validate_finalize_phase(
+        self,
+        snapshot_id: str,
+        alias: str,
+        total_items: Optional[int],
+        uid_digest: Optional[str],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+        """Validate preconditions for snapshot finalize phase."""
+        async with self._lock:
+            snap = self._data.get("snapshots", {}).get(snapshot_id)
+            if not snap:
+                return None, CODE_SNAPSHOT_NOT_FOUND, f"Snapshot session '{snapshot_id}' does not exist."
+            if snap.get("alias") != alias:
+                return snap, CODE_INVALID_REQUEST, f"Snapshot session belongs to alias '{snap.get('alias')}', not '{alias}'."
+            if snap.get("status") == SNAPSHOT_STATUS_SUPERSEDED or snap.get("superseded_by"):
+                return snap, CODE_SNAPSHOT_SUPERSEDED, f"Snapshot session has been superseded by '{snap.get('superseded_by')}'."
+
+            # Idempotent finalize on already completed snapshot
+            if snap.get("status") == SNAPSHOT_STATUS_COMPLETED:
+                return snap, None, None
+
+            if snap.get("status") == SNAPSHOT_STATUS_FAILED:
+                return snap, CODE_INTERNAL_ERROR, f"Snapshot session is in failed state: {snap.get('error')}."
+
+            unresolved = snap.get("unresolved_uids", [])
+            if unresolved:
+                return snap, CODE_SNAPSHOT_FINALIZE_CONFLICT, f"{len(unresolved)} items failed during ingestion and must be resolved before finalization."
+
+            expected_count = snap.get("expected_item_count", 0)
+            received_uids = snap.get("received_uids", [])
+            received_count = len(received_uids)
+
+            if total_items is not None and total_items != expected_count:
+                return snap, CODE_SNAPSHOT_INCOMPLETE, f"Finalize total_items ({total_items}) does not match expected_item_count ({expected_count})."
+
+            if received_count != expected_count:
+                return snap, CODE_SNAPSHOT_INCOMPLETE, f"Snapshot incomplete: expected {expected_count} items, received {received_count}."
+
+            expected_digest = snap.get("expected_uid_digest")
+            actual_digest = compute_uid_digest(received_uids)
+
+            if actual_digest != expected_digest:
+                return snap, CODE_SNAPSHOT_DIGEST_MISMATCH, f"UID digest mismatch: expected '{expected_digest}', computed '{actual_digest}'."
+
+            if uid_digest is not None:
+                norm_finalize_digest = normalize_digest(uid_digest)
+                if norm_finalize_digest != actual_digest:
+                    return snap, CODE_SNAPSHOT_DIGEST_MISMATCH, f"UID digest mismatch: finalize specified '{norm_finalize_digest}', computed '{actual_digest}'."
+
+            return snap, None, None
+
+    async def complete_snapshot(
+        self,
+        snapshot_id: str,
+        deleted_count: int,
+        target_total_before: int,
+        target_total_after: int,
+    ) -> Dict[str, Any]:
+        """Mark snapshot session completed and record reconciliation counts."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._lock:
+            snap = self._data.get("snapshots", {}).get(snapshot_id)
+            if not snap:
+                raise ValueError(f"Snapshot {snapshot_id} not found")
+            snap["status"] = SNAPSHOT_STATUS_COMPLETED
+            snap["deleted_count"] = deleted_count
+            snap["target_total_before"] = target_total_before
+            snap["target_total_after"] = target_total_after
+            snap["completed_at"] = now_iso
+            snap["updated_at"] = now_iso
+        await self.async_save()
+        return snap
+
+    async def fail_snapshot(self, snapshot_id: str, error_message: str) -> None:
+        """Mark a snapshot as failed."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._lock:
+            snap = self._data.get("snapshots", {}).get(snapshot_id)
+            if snap:
+                snap["status"] = SNAPSHOT_STATUS_FAILED
+                snap["error"] = error_message
+                snap["updated_at"] = now_iso
+        await self.async_save()
+
+    async def get_latest_snapshot(self, alias: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Return the most recently updated snapshot record for an alias."""
+        async with self._lock:
+            snaps = self._data.get("snapshots", {})
+            matching = [
+                s for s in snaps.values()
+                if alias is None or s.get("alias") == alias
+            ]
+            if not matching:
+                return None
+            matching.sort(key=lambda s: s.get("updated_at") or s.get("created_at") or "", reverse=True)
+            return matching[0]
