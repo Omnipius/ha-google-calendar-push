@@ -1460,13 +1460,37 @@ class GoogleCalendarPushView(HomeAssistantView):
 
                 existing_events = await self.hass.async_add_executor_job(fetch_all_events)
                 received_set = set(snap_record.get("received_uids", []))
-                target_total_before = len(existing_events)
+                target_total_before = len([ev for ev in existing_events if ev.get("status") != "cancelled"])
 
-                events_to_delete = []
+                # Identify all stale events not in received_set
+                stale_events = []
+                stale_master_ids = set()
                 for ev in existing_events:
+                    if ev.get("status") == "cancelled":
+                        continue
                     ev_uid = ev.get("iCalUID") or ev.get("id")
                     if ev_uid not in received_set:
-                        events_to_delete.append(ev)
+                        stale_events.append(ev)
+                        if not ev.get("recurringEventId"):
+                            stale_master_ids.add(ev["id"])
+
+                # Only issue delete requests for master events or detached instances whose master
+                # is not already being deleted (deleting a recurring master automatically deletes all instances)
+                events_to_delete = []
+                seen_ids = set()
+                for ev in stale_events:
+                    ev_id = ev["id"]
+                    if ev_id in seen_ids:
+                        continue
+                    parent_id = ev.get("recurringEventId")
+                    if parent_id and parent_id in stale_master_ids:
+                        _LOGGER.debug(
+                            "Skipping delete of recurring instance %s because master series %s is being deleted",
+                            ev_id, parent_id
+                        )
+                        continue
+                    seen_ids.add(ev_id)
+                    events_to_delete.append(ev)
 
                 deleted_count = 0
                 if events_to_delete:
@@ -1475,9 +1499,20 @@ class GoogleCalendarPushView(HomeAssistantView):
                         errors = []
                         def del_cb(request_id, response, exception):
                             if exception:
+                                is_ignorable = False
+                                if isinstance(exception, HttpError):
+                                    status = getattr(getattr(exception, "resp", None), "status", None)
+                                    if status in (404, 409, 410):
+                                        is_ignorable = True
                                 err_str = str(exception)
-                                if "404" not in err_str:
+                                if "404" in err_str or "409" in err_str or "410" in err_str or "Conflict" in err_str:
+                                    is_ignorable = True
+
+                                if is_ignorable:
+                                    _LOGGER.debug("Ignoring benign error while deleting stale event %s: %s", request_id, exception)
+                                else:
                                     errors.append(exception)
+
                         for ev in chunk:
                             batch.add(service.events().delete(calendarId=calendar_id, eventId=ev["id"]), callback=del_cb)
                         batch.execute()
@@ -1488,9 +1523,10 @@ class GoogleCalendarPushView(HomeAssistantView):
                     for i in range(0, len(events_to_delete), chunk_size):
                         chunk = events_to_delete[i:i + chunk_size]
                         await self.hass.async_add_executor_job(delete_chunk_sync, chunk)
-                        deleted_count += len(chunk)
 
-                    for ev in events_to_delete:
+                    deleted_count = len(stale_events)
+
+                    for ev in stale_events:
                         tomb_uid = ev.get("iCalUID") or ev.get("id")
                         await self.storage.record_event_mutation(
                             alias=calendar_alias,

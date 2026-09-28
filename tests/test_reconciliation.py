@@ -607,3 +607,84 @@ async def test_reconciliation_unresolved_items_block_finalize(test_setup):
     data_fin = json.loads(resp_fin.body.decode())
     assert data_fin["errors"][0]["code"] == CODE_SNAPSHOT_FINALIZE_CONFLICT
     assert "1 items failed during ingestion and must be resolved before finalization" in data_fin["errors"][0]["message"]
+
+@pytest.mark.asyncio
+async def test_reconciliation_recurring_series_avoids_batch_conflict(test_setup):
+    """Test that deleting a stale recurring series skips its instances to avoid batch 409 conflict."""
+    hass, session, storage, view, google_service = test_setup
+
+    empty_digest = compute_uid_digest([])
+
+    # Mock calendar containing 1 master series and 2 exception instances
+    google_service._events_mock.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "_master_series_1",
+                "iCalUID": "stale-rec-series-1",
+                "recurringEventId": None,
+                "recurrence": ["RRULE:FREQ=WEEKLY"],
+            },
+            {
+                "id": "_master_series_1_20260312T203500Z",
+                "iCalUID": "stale-rec-series-1",
+                "recurringEventId": "_master_series_1",
+            },
+            {
+                "id": "_master_series_1_20260402T203500Z",
+                "iCalUID": "stale-rec-series-1",
+                "recurringEventId": "_master_series_1",
+            },
+        ]
+    }
+
+    # Intercept batch delete calls to verify only master is deleted
+    deleted_ids = []
+    def custom_batch_behavior(req, req_id):
+        # Extract eventId from req if available
+        return {"status": "confirmed"}, None
+
+    # Track calls to delete
+    original_delete = google_service._events_mock.delete
+    def mock_delete(*args, **kwargs):
+        eid = kwargs.get("eventId")
+        deleted_ids.append(eid)
+        return original_delete(*args, **kwargs)
+    google_service._events_mock.delete = mock_delete
+
+    # Begin
+    await view.post(MockRequest({
+        "schema_version": 1,
+        "request_id": "req-b",
+        "target_alias": "work",
+        "snapshot": {
+            "snapshot_id": "snap-rec-conflict",
+            "mode": SNAPSHOT_MODE_REPLACE_ALL,
+            "phase": SNAPSHOT_PHASE_BEGIN,
+            "expected_item_count": 0,
+            "expected_uid_digest": empty_digest,
+        }
+    }), "work")
+
+    # Finalize (empty snapshot, cutover deletes stale recurring series)
+    resp = await view.post(MockRequest({
+        "schema_version": 1,
+        "request_id": "req-f",
+        "target_alias": "work",
+        "snapshot": {
+            "snapshot_id": "snap-rec-conflict",
+            "mode": SNAPSHOT_MODE_REPLACE_ALL,
+            "phase": SNAPSHOT_PHASE_FINALIZE,
+            "total_items": 0,
+            "uid_digest": empty_digest,
+        }
+    }), "work")
+
+    assert resp.status == 200
+    data = json.loads(resp.body.decode())
+    assert data["snapshot"]["status"] == SNAPSHOT_STATUS_COMPLETED
+
+    # Verify that only the master series was queued for delete, NOT the child instances
+    assert "_master_series_1" in deleted_ids
+    assert "_master_series_1_20260312T203500Z" not in deleted_ids
+    assert "_master_series_1_20260402T203500Z" not in deleted_ids
+
