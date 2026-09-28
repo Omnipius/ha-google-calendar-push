@@ -3,7 +3,7 @@ import datetime
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Union, List, Optional, Annotated
 
-from pydantic import field_serializer, FieldSerializationInfo, BeforeValidator, Field
+from pydantic import field_serializer, FieldSerializationInfo, BeforeValidator, Field, AliasChoices
 
 from ical.parsing.property import ParsedProperty, ParsedPropertyParameter
 from ical.types.data_types import serialize_field, DATA_TYPE
@@ -14,6 +14,18 @@ from ical.event import Event as iCalEvent
 
 def contains_regex(regex: re.Pattern, value: str) -> re.Match | None:
     return re.search(regex.pattern.removeprefix('^').removesuffix('$'), value)
+
+def parse_classification(value: Any) -> Optional[str]:
+    """Parse classification field allowing None, empty string, or whitespace as unrestricted."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        return cleaned.upper()
+    return value
+
 
 def parse_date_and_datetime(value: str | datetime.date | Dict[str,str] | None) -> datetime.date | None:
     """Coerce str or ICS formatted JSON dict into date and datetime value."""
@@ -101,12 +113,31 @@ class Event(iCalEvent):
         Union[datetime.datetime, datetime.date, None],
         BeforeValidator(parse_date_and_datetime),
     ] = Field(
-        alias="recurrence-id",
         default=None,
+        validation_alias=AliasChoices("recurrence-id", "recurrence_id"),
+    )
+
+    # Classification handling (supports absent, null, blank, and values like PUBLIC)
+    classification: Annotated[
+        Optional[str],
+        BeforeValidator(parse_classification),
+    ] = Field(
+        default=None,
+        validation_alias=AliasChoices("class", "classification"),
+    )
+
+    # Source revision tracking
+    source_revision: Annotated[
+        Optional[str],
+        BeforeValidator(lambda v: str(v).strip() if v is not None and str(v).strip() != "" else None),
+    ] = Field(
+        default=None,
+        validation_alias=AliasChoices("source-revision", "source_revision"),
     )
 
     # Add the nested exceptions dictionary
     exceptions: Optional[Dict[Union[datetime.date, datetime.datetime, str], Optional["Event"]]] = None
+
 
     @field_serializer('*')
     def serialize_fields(self, value: Any, info: FieldSerializationInfo) -> Any:

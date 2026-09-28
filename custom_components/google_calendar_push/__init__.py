@@ -10,6 +10,7 @@ from homeassistant.helpers.config_entry_oauth2_flow import OAuth2TokenRequestRea
 
 from .const import DOMAIN, CONF_CALENDARS, CONF_CALENDAR_ALIASES, PLATFORMS
 from .api import GoogleCalendarPushView
+from .storage import PushStorageManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,15 +48,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         legacy_cals = entry.options.get(CONF_CALENDARS, [])
         calendar_aliases = {slugify_fallback(c): c for c in legacy_cals}
 
+    # Initialize and load durable storage
+    storage = PushStorageManager(hass, entry.entry_id)
+    await storage.async_load()
+
     # Store data for the sensor platform to access
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         "session": session,
-        "aliases": calendar_aliases
+        "aliases": calendar_aliases,
+        "storage": storage,
     }
 
     # Register the custom REST View
-    hass.http.register_view(GoogleCalendarPushView(hass, session, calendar_aliases))
+    hass.http.register_view(GoogleCalendarPushView(hass, session, calendar_aliases, storage=storage))
+
     
     # Forward the setup to sensor.py
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

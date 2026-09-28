@@ -49,6 +49,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     data = hass.data[DOMAIN][entry.entry_id]
     session = data["session"]
     aliases = data["aliases"] # Format: { "alias": "calendar_id" }
+    storage = data.get("storage")
     
     if not aliases:
         return
@@ -65,7 +66,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities = []
     for alias, cid in aliases.items():
         entities.append(
-            GoogleCalendarEndpointSensor(alias, cid, names.get(cid, cid), entry.entry_id)
+            GoogleCalendarEndpointSensor(alias, cid, names.get(cid, cid), entry.entry_id, storage=storage)
         )
         
     async_add_entities(entities)
@@ -77,9 +78,10 @@ class GoogleCalendarEndpointSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 
-    def __init__(self, alias, calendar_id, calendar_name, entry_id):
+    def __init__(self, alias, calendar_id, calendar_name, entry_id, storage=None):
         """Initialize the sensor."""
         self._alias = alias
+        self._storage = storage
         
         # Name the sensor based on the alias
         self._attr_name = f"Push Endpoint ({alias})"
@@ -100,6 +102,10 @@ class GoogleCalendarEndpointSensor(SensorEntity):
             "web_url": web_url,
             "last_operation": "None",
             "last_events_processed": 0,
+            "last_request_id": None,
+            "last_overall_status": None,
+            "last_status_summary": {},
+            "tombstones_count": 0,
             "last_received": "Never"
         }
         
@@ -112,13 +118,44 @@ class GoogleCalendarEndpointSensor(SensorEntity):
                 self._handle_push_update
             )
         )
+        if self._storage:
+            try:
+                t_count = await self._storage.get_tombstones_count(self._alias)
+                self._attr_extra_state_attributes["tombstones_count"] = t_count
+            except Exception:
+                pass
 
     @callback
-    def _handle_push_update(self, operation, count):
+    def _handle_push_update(self, *args, **kwargs):
         """Handle a push notification update."""
         self._attr_native_value = dt_util.now()
-        self._attr_extra_state_attributes["last_operation"] = operation
-        self._attr_extra_state_attributes["last_events_processed"] = count
+        
+        if args and isinstance(args[0], dict):
+            info = args[0]
+            self._attr_extra_state_attributes["last_operation"] = info.get("operation", "push")
+            self._attr_extra_state_attributes["last_events_processed"] = info.get("processed_count", 0)
+            self._attr_extra_state_attributes["last_request_id"] = info.get("request_id")
+            self._attr_extra_state_attributes["last_overall_status"] = info.get("overall_status")
+            
+            summary = {}
+            for r in info.get("results", []):
+                st = r.get("status", "unknown")
+                summary[st] = summary.get(st, 0) + 1
+            self._attr_extra_state_attributes["last_status_summary"] = summary
+        elif len(args) >= 2:
+            self._attr_extra_state_attributes["last_operation"] = args[0]
+            self._attr_extra_state_attributes["last_events_processed"] = args[1]
+
         self._attr_extra_state_attributes["last_received"] = dt_util.now().isoformat()
         
-        self.async_write_ha_state()
+        if self._storage:
+            async def _update_tombstones():
+                try:
+                    c = await self._storage.get_tombstones_count(self._alias)
+                    self._attr_extra_state_attributes["tombstones_count"] = c
+                    self.async_write_ha_state()
+                except Exception:
+                    pass
+            self.hass.async_create_task(_update_tombstones())
+        else:
+            self.async_write_ha_state()
